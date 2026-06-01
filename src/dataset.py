@@ -117,6 +117,33 @@ class FundusSegmentationDataset(Dataset):
         return image_tensor, mask_tensor
 
 
+class GeometricTransform:
+    """
+    Lightweight geometric augmentation using numpy only (no albumentations).
+
+    Applied identically to image and mask to keep them in sync.
+    Operations: horizontal flip, vertical flip, random 90-degree rotation.
+    Each applied independently with probability p.
+    """
+
+    def __init__(self, p: float = 0.5, seed: int | None = None) -> None:
+        self.p = p
+        self.rng = np.random.default_rng(seed)
+
+    def __call__(self, image: np.ndarray, mask: np.ndarray) -> dict[str, np.ndarray]:
+        if self.rng.random() < self.p:
+            image = np.fliplr(image).copy()
+            mask = np.fliplr(mask).copy()
+        if self.rng.random() < self.p:
+            image = np.flipud(image).copy()
+            mask = np.flipud(mask).copy()
+        if self.rng.random() < self.p:
+            k = self.rng.integers(1, 4)          # rotate 90, 180, or 270 degrees
+            image = np.rot90(image, k).copy()
+            mask = np.rot90(mask, k).copy()
+        return {"image": image, "mask": mask}
+
+
 if __name__ == "__main__":
     dataset = FundusSegmentationDataset(split="train")
     image, mask = dataset[0]
