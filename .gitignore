@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Dataset (too large for git — upload to AutoDL separately)
+dataset/
+dataset.zip
+
+# Model outputs and artifacts (generated, not source)
+outputs/
+src.zip
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
