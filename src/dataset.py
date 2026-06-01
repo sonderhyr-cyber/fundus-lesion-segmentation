@@ -8,7 +8,45 @@ import torch
 from torch.utils.data import Dataset
 
 from paths import DATA_ROOT
+
 IMAGE_SIZE = (512, 512)
+
+# CLAHE preprocessing parameters
+# Applied to the L (luminance) channel in LAB space before training.
+# clip_limit controls contrast amplification ceiling (prevents noise blow-up).
+# tile_size defines the local block size for adaptive equalization.
+CLAHE_CLIP_LIMIT = 2.0
+CLAHE_TILE_SIZE = 8
+GAMMA = 0.8  # < 1 brightens dark regions, enhancing low-contrast lesions (MA)
+
+
+def apply_clahe_gamma(image_rgb: np.ndarray) -> np.ndarray:
+    """
+    Enhance retinal fundus image contrast.
+
+    Steps (following the preprocessing pipeline from the literature):
+    1. Convert to LAB and apply CLAHE to the L channel only —
+       improves local contrast without distorting colour.
+    2. Apply gamma correction (γ=0.8) to brighten dark lesion regions.
+
+    Input/output: uint8 RGB image, same shape.
+    """
+    # Step 1: CLAHE on luminance channel
+    lab = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2LAB)
+    clahe = cv2.createCLAHE(
+        clipLimit=CLAHE_CLIP_LIMIT,
+        tileGridSize=(CLAHE_TILE_SIZE, CLAHE_TILE_SIZE),
+    )
+    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+    # Step 2: Gamma correction — output = (input/255)^γ * 255
+    enhanced = np.clip(
+        ((enhanced / 255.0) ** GAMMA) * 255.0, 0, 255
+    ).astype(np.uint8)
+
+    return enhanced
+
 
 NUM_CLASSES = 5  # background + MA/HE/EX/SE
 CLASS_NAMES = {
@@ -103,6 +141,7 @@ class FundusSegmentationDataset(Dataset):
         polygons = parse_yolo_segmentation(label_path, img_h, img_w)
         mask = yolo_polygons_to_semantic_mask(polygons, img_h, img_w)
 
+        image_rgb = apply_clahe_gamma(image_rgb)
         image_rgb = cv2.resize(image_rgb, IMAGE_SIZE, interpolation=cv2.INTER_LINEAR)
         mask = cv2.resize(mask, IMAGE_SIZE, interpolation=cv2.INTER_NEAREST)
 
