@@ -14,15 +14,15 @@ if str(SRC_DIR) not in sys.path:
 from paths import CHECKPOINT_PATH
 from dataset import NUM_CLASSES, FundusSegmentationDataset
 from model.unet import UNet
+from model.loss import DiceCELoss
 
 BATCH_SIZE = 4
-EPOCHS = 5
-LEARNING_RATE = 1e-3
+EPOCHS = 30
+LEARNING_RATE = 3e-4
 
-# Median-frequency class weights computed from the training set pixel distribution.
+# Median-frequency class weights for the CE component of DiceCELoss.
 # freq[c] = pixel_count[c] / total_pixels  (from outputs/dataset_class_stats.csv)
 # weight[c] = median(freq) / freq[c]
-# Background is heavily down-weighted; rare lesions (MA, SE) are up-weighted.
 CLASS_WEIGHTS = torch.tensor([0.0027, 7.37, 0.53, 1.00, 2.80])
 
 
@@ -113,7 +113,10 @@ def main() -> None:
     )
 
     model = UNet(in_channels=3, num_classes=NUM_CLASSES).to(device)
-    criterion = nn.CrossEntropyLoss(weight=CLASS_WEIGHTS.to(device))
+    criterion = DiceCELoss(
+        num_classes=NUM_CLASSES,
+        class_weights=CLASS_WEIGHTS.to(device),
+    )
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     best_val_loss = float("inf")
