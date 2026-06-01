@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import albumentations as A
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -17,8 +18,17 @@ from model.unet import UNet
 from model.loss import DiceCELoss
 
 BATCH_SIZE = 4
-EPOCHS = 30
+EPOCHS = 50
 LEARNING_RATE = 3e-4
+
+# Training augmentations — applied only to the training split.
+# Geometric-only: retinal image colour carries diagnostic meaning,
+# so colour jitter is intentionally excluded.
+TRAIN_TRANSFORM = A.Compose([
+    A.HorizontalFlip(p=0.5),
+    A.VerticalFlip(p=0.5),
+    A.RandomRotate90(p=0.5),
+])
 
 # Median-frequency class weights for the CE component of DiceCELoss.
 # freq[c] = pixel_count[c] / total_pixels  (from outputs/dataset_class_stats.csv)
@@ -96,7 +106,7 @@ def main() -> None:
     device = get_device()
     print(f"Device: {device}")
 
-    train_dataset = FundusSegmentationDataset(split="train")
+    train_dataset = FundusSegmentationDataset(split="train", transform=TRAIN_TRANSFORM)
     val_dataset = FundusSegmentationDataset(split="valid")
 
     train_loader = DataLoader(
