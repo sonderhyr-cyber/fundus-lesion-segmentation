@@ -12,17 +12,13 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from paths import CHECKPOINT_PATH
-from dataset import NUM_CLASSES, FundusSegmentationDataset, GeometricTransform
+from dataset import NUM_CLASSES, FundusSegmentationDataset
 from model.unet import UNet
 from model.loss import DiceCELoss
 
 BATCH_SIZE = 4
-EPOCHS = 50
+EPOCHS = 100
 LEARNING_RATE = 3e-4
-
-# Geometric-only augmentation (flip + rotate90), numpy-based, no extra deps.
-# Colour jitter excluded — retinal image colour carries diagnostic meaning.
-TRAIN_TRANSFORM = GeometricTransform(p=0.5)
 
 # Median-frequency class weights for the CE component of DiceCELoss.
 # freq[c] = pixel_count[c] / total_pixels  (from outputs/dataset_class_stats.csv)
@@ -100,7 +96,7 @@ def main() -> None:
     device = get_device()
     print(f"Device: {device}")
 
-    train_dataset = FundusSegmentationDataset(split="train", transform=TRAIN_TRANSFORM)
+    train_dataset = FundusSegmentationDataset(split="train")
     val_dataset = FundusSegmentationDataset(split="valid")
 
     train_loader = DataLoader(
@@ -122,14 +118,19 @@ def main() -> None:
         class_weights=CLASS_WEIGHTS.to(device),
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=5
+    )
 
     best_val_loss = float("inf")
 
     for epoch in range(1, EPOCHS + 1):
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_loss = validate(model, val_loader, criterion, device)
+        scheduler.step(val_loss)
 
-        print(f"Epoch [{epoch}/{EPOCHS}] train loss: {train_loss:.4f}  val loss: {val_loss:.4f}")
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(f"Epoch [{epoch}/{EPOCHS}] train loss: {train_loss:.4f}  val loss: {val_loss:.4f}  lr: {current_lr:.2e}")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
