@@ -1,0 +1,11 @@
+# PyTorch must be installed separately with the correct CUDA version.
+# On AutoDL, PyTorch + CUDA is pre-installed — do NOT reinstall via pip.
+# Locally (CPU / MPS):
+#   pip install torch
+#
+# On a fresh CUDA server without a pre-built image:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu118
+
+numpy>=1.24.0
+opencv-python>=4.7.0
+matplotlib>=3.7.0
