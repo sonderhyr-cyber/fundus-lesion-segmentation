@@ -20,7 +20,7 @@ from baselines.smp.evaluate import compute_metrics_from_loader
 
 # ── Hyperparameters ──────────────────────────────────────────────────────────
 BATCH_SIZE = 4
-EPOCHS = 20
+EPOCHS = 50
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 
@@ -30,7 +30,18 @@ EPOCH_SIZE = 1500
 FG_RATIO = 0.8
 
 # Stop early if val Dice does not improve for this many consecutive epochs.
-EARLY_STOP_PATIENCE = 10
+EARLY_STOP_PATIENCE = 15
+
+# ── Class weights (derived from run-1 per-class Dice) ────────────────────────
+# Dice weights: foreground only — order: MA, HE, EX, SE
+# Higher weight → model pays more attention to that class.
+# Inverse-Dice from run 1: MA=0.068, HE=0.174, EX=0.356, SE=0.118
+# Soft inverse (square-root scaling to avoid over-penalising hard classes):
+#   sqrt(1/Dice) → MA≈3.84, HE≈2.40, EX≈1.68, SE≈2.91  → normalised below
+DICE_CLASS_WEIGHTS = [2.0, 1.2, 0.8, 1.5]   # MA, HE, EX, SE
+
+# CE weights: all 5 classes (background kept low — already at 0.9963 Dice)
+CE_CLASS_WEIGHTS = [0.5, 4.0, 2.0, 1.0, 3.0]  # bg, MA, HE, EX, SE
 
 # ── Output paths ─────────────────────────────────────────────────────────────
 SMP_DIR = OUTPUT_DIR / "smp"
@@ -147,11 +158,17 @@ def main() -> None:
     )
 
     model = build_smp_unet(num_classes=NUM_CLASSES).to(device)
-    criterion = CombinedDiceCELoss(num_classes=NUM_CLASSES)
+    ce_weights = torch.tensor(CE_CLASS_WEIGHTS, dtype=torch.float32).to(device)
+    criterion = CombinedDiceCELoss(
+        num_classes=NUM_CLASSES,
+        dice_class_weights=DICE_CLASS_WEIGHTS,
+        ce_class_weights=ce_weights,
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     # mode="max": scheduler reduces LR when val Dice stops increasing.
+    # patience=7: wait 7 epochs before halving LR (run-1 used 3 — too aggressive).
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=3
+        optimizer, mode="max", factor=0.5, patience=7
     )
 
     best_val_dice = 0.0
