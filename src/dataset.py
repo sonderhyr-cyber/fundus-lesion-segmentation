@@ -231,16 +231,28 @@ class ForegroundPatchDataset(Dataset):
         self._polygons: list[list[tuple[int, np.ndarray]]] = []
         self._fg_index: list[tuple[int, int]] = []  # (sample_idx, polygon_idx)
 
+        # Cache all images and masks in memory so __getitem__ never hits disk.
+        # 338 train images at native resolution ≈ 1–2 GB RAM — acceptable on AutoDL.
+        self._image_cache: list[np.ndarray] = []  # RGB uint8
+        self._mask_cache:  list[np.ndarray] = []  # uint8 semantic mask
+
+        print(f"Loading {len(raw_samples)} images into memory cache...")
         for s_idx, (img_path, lbl_path) in enumerate(raw_samples):
-            img_probe = cv2.imread(str(img_path))
-            if img_probe is None:
+            img_bgr = cv2.imread(str(img_path))
+            if img_bgr is None:
                 continue
-            h, w = img_probe.shape[:2]
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            h, w = img_rgb.shape[:2]
             polygons = parse_yolo_segmentation(lbl_path, h, w)
+            mask = yolo_polygons_to_semantic_mask(polygons, h, w)
+            img_rgb = apply_clahe_gamma(img_rgb)
             self._samples.append((img_path, lbl_path))
             self._polygons.append(polygons)
+            self._image_cache.append(img_rgb)
+            self._mask_cache.append(mask)
             for p_idx, _ in enumerate(polygons):
                 self._fg_index.append((len(self._samples) - 1, p_idx))
+        print(f"Cache ready: {len(self._image_cache)} images loaded.")
 
         if not self._fg_index:
             raise RuntimeError("No foreground polygons found — check label files.")
@@ -283,18 +295,10 @@ class ForegroundPatchDataset(Dataset):
     # ------------------------------------------------------------------
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         s_idx, hint_cx, hint_cy = self._epoch_index[idx]
-        img_path, lbl_path = self._samples[s_idx]
 
-        image_bgr = cv2.imread(str(img_path))
-        if image_bgr is None:
-            raise RuntimeError(f"Cannot read image: {img_path}")
-        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        image_rgb = self._image_cache[s_idx]
+        mask      = self._mask_cache[s_idx]
         img_h, img_w = image_rgb.shape[:2]
-
-        mask = yolo_polygons_to_semantic_mask(
-            self._polygons[s_idx], img_h, img_w
-        )
-        image_rgb = apply_clahe_gamma(image_rgb)
 
         # Determine patch centre
         half = self.half

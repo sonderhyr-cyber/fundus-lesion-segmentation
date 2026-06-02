@@ -142,13 +142,13 @@ def main() -> None:
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=0,
+        num_workers=4,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=0,
+        num_workers=4,
     )
 
     model = UNet(in_channels=3, num_classes=NUM_CLASSES).to(device)
