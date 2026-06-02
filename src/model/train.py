@@ -25,6 +25,9 @@ LEARNING_RATE = 3e-4
 EPOCH_SIZE = 1500
 FG_RATIO   = 0.8
 
+# Early stopping: halt training if val loss does not improve for this many epochs.
+EARLY_STOP_PATIENCE = 20
+
 # Set to True to ignore an existing checkpoint and train from scratch.
 # Needed when the saved model was trained with a different strategy.
 RESET_TRAINING = True
@@ -170,6 +173,8 @@ def main() -> None:
         print(f"Already trained for {EPOCHS} epochs. Done.")
         return
 
+    epochs_no_improve = 0
+
     for epoch in range(start_epoch, EPOCHS + 1):
         # Re-sample the patch index each epoch so the model sees different
         # crops every epoch rather than the same EPOCH_SIZE patches repeatedly.
@@ -184,8 +189,15 @@ def main() -> None:
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            epochs_no_improve = 0
             save_checkpoint(model, optimizer, scheduler, CHECKPOINT_PATH, epoch, val_loss)
             print(f"  Saved best model to {CHECKPOINT_PATH}")
+        else:
+            epochs_no_improve += 1
+            print(f"  No improvement for {epochs_no_improve}/{EARLY_STOP_PATIENCE} epochs.")
+            if epochs_no_improve >= EARLY_STOP_PATIENCE:
+                print(f"Early stopping triggered at epoch {epoch}.")
+                break
 
     print(f"Training finished. Best val loss: {best_val_loss:.4f}")
 
