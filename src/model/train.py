@@ -12,18 +12,22 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from paths import CHECKPOINT_PATH
-from dataset import NUM_CLASSES, FundusSegmentationDataset
+from dataset import NUM_CLASSES, ForegroundPatchDataset, FundusSegmentationDataset
 from model.unet import UNet
-from model.loss import DiceCELoss
+from model.loss import FocalTverskyLoss
 
-BATCH_SIZE = 4
-EPOCHS = 100
+BATCH_SIZE    = 4
+EPOCHS        = 100
 LEARNING_RATE = 3e-4
 
-# Median-frequency class weights for the CE component of DiceCELoss.
-# freq[c] = pixel_count[c] / total_pixels  (from outputs/dataset_class_stats.csv)
-# weight[c] = median(freq) / freq[c]
-CLASS_WEIGHTS = torch.tensor([0.0027, 7.37, 0.53, 1.00, 2.80])
+# Patches sampled per epoch from the foreground-biased patch dataset.
+# 80 % of patches are centred on a foreground polygon (native resolution crop).
+EPOCH_SIZE = 1500
+FG_RATIO   = 0.8
+
+# Set to True to ignore an existing checkpoint and train from scratch.
+# Needed when the saved model was trained with a different strategy.
+RESET_TRAINING = True
 
 
 def get_device() -> torch.device:
@@ -80,23 +84,55 @@ def validate(
     return total_loss / len(loader.dataset)
 
 
-def save_checkpoint(model: nn.Module, path: Path, epoch: int, val_loss: float) -> None:
+def save_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    path: Path,
+    epoch: int,
+    val_loss: float,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
             "val_loss": val_loss,
         },
         path,
     )
 
 
+def load_checkpoint(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    device: torch.device,
+) -> tuple[int, float]:
+    """Load checkpoint and return (start_epoch, best_val_loss)."""
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    start_epoch = checkpoint["epoch"] + 1
+    best_val_loss = checkpoint["val_loss"]
+    print(f"Resumed from epoch {checkpoint['epoch']}, best val loss: {best_val_loss:.4f}")
+    return start_epoch, best_val_loss
+
+
 def main() -> None:
     device = get_device()
     print(f"Device: {device}")
 
-    train_dataset = FundusSegmentationDataset(split="train")
+    train_dataset = ForegroundPatchDataset(
+        split="train",
+        epoch_size=EPOCH_SIZE,
+        fg_ratio=FG_RATIO,
+        transform=None,
+    )
     val_dataset = FundusSegmentationDataset(split="valid")
 
     train_loader = DataLoader(
@@ -113,18 +149,32 @@ def main() -> None:
     )
 
     model = UNet(in_channels=3, num_classes=NUM_CLASSES).to(device)
-    criterion = DiceCELoss(
-        num_classes=NUM_CLASSES,
-        class_weights=CLASS_WEIGHTS.to(device),
-    )
+    criterion = FocalTverskyLoss(num_classes=NUM_CLASSES)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=5
     )
 
-    best_val_loss = float("inf")
+    # Resume from checkpoint unless RESET_TRAINING is set.
+    if not RESET_TRAINING and CHECKPOINT_PATH.exists():
+        start_epoch, best_val_loss = load_checkpoint(
+            CHECKPOINT_PATH, model, optimizer, scheduler, device
+        )
+    else:
+        if RESET_TRAINING and CHECKPOINT_PATH.exists():
+            print("RESET_TRAINING=True — ignoring existing checkpoint, starting fresh.")
+        start_epoch = 1
+        best_val_loss = float("inf")
 
-    for epoch in range(1, EPOCHS + 1):
+    if start_epoch > EPOCHS:
+        print(f"Already trained for {EPOCHS} epochs. Done.")
+        return
+
+    for epoch in range(start_epoch, EPOCHS + 1):
+        # Re-sample the patch index each epoch so the model sees different
+        # crops every epoch rather than the same EPOCH_SIZE patches repeatedly.
+        train_dataset._build_epoch_index()
+
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_loss = validate(model, val_loader, criterion, device)
         scheduler.step(val_loss)
@@ -134,7 +184,7 @@ def main() -> None:
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            save_checkpoint(model, CHECKPOINT_PATH, epoch, val_loss)
+            save_checkpoint(model, optimizer, scheduler, CHECKPOINT_PATH, epoch, val_loss)
             print(f"  Saved best model to {CHECKPOINT_PATH}")
 
     print(f"Training finished. Best val loss: {best_val_loss:.4f}")

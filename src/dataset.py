@@ -183,6 +183,144 @@ class GeometricTransform:
         return {"image": image, "mask": mask}
 
 
+class ForegroundPatchDataset(Dataset):
+    """
+    Patch-based dataset that crops 512×512 patches from images at their native
+    resolution, with foreground-biased centre sampling.
+
+    Why patches instead of full-image resize?
+    - Native resolution preserves micro-lesion detail (MA ≈ 5–20 px in a
+      ~1500 px image; after resize to 512 it can collapse to 0–1 px).
+    - Foreground bias forces the model to see lesion pixels on most steps.
+
+    Sampling strategy per patch:
+    - With probability `fg_ratio`: pick a random foreground polygon centroid
+      as the patch centre (weighted by polygon area so larger lesions are
+      sampled proportionally more).
+    - Otherwise: pick a uniformly random centre in the image.
+    The centre is clamped so the 512×512 window never goes out of bounds.
+    """
+
+    PATCH_SIZE = 512
+
+    def __init__(
+        self,
+        root: str | Path = DATA_ROOT,
+        split: str = "train",
+        epoch_size: int = 1500,
+        fg_ratio: float = 0.8,
+        transform=None,
+    ) -> None:
+        self.root       = Path(root)
+        self.split      = split
+        self.epoch_size = epoch_size
+        self.fg_ratio   = fg_ratio
+        self.transform  = transform
+        self.half       = self.PATCH_SIZE // 2
+
+        image_dir = self.root / "images" / split
+        label_dir = self.root / "labels" / split
+        raw_samples = collect_samples(image_dir, label_dir)
+        if not raw_samples:
+            raise FileNotFoundError(f"No image-label pairs found under {image_dir}")
+
+        # Pre-parse polygons so __getitem__ only needs to read the image.
+        # fg_index: flat list of (img_path, lbl_path, polygon_idx) for each
+        # foreground polygon across all images.
+        self._samples: list[tuple[Path, Path]] = []
+        self._polygons: list[list[tuple[int, np.ndarray]]] = []
+        self._fg_index: list[tuple[int, int]] = []  # (sample_idx, polygon_idx)
+
+        for s_idx, (img_path, lbl_path) in enumerate(raw_samples):
+            img_probe = cv2.imread(str(img_path))
+            if img_probe is None:
+                continue
+            h, w = img_probe.shape[:2]
+            polygons = parse_yolo_segmentation(lbl_path, h, w)
+            self._samples.append((img_path, lbl_path))
+            self._polygons.append(polygons)
+            for p_idx, _ in enumerate(polygons):
+                self._fg_index.append((len(self._samples) - 1, p_idx))
+
+        if not self._fg_index:
+            raise RuntimeError("No foreground polygons found — check label files.")
+
+        # Pre-build the epoch index (length = epoch_size) so DataLoader's
+        # shuffle gives consistent batches without re-sampling every step.
+        self._build_epoch_index()
+
+    # ------------------------------------------------------------------
+    def _build_epoch_index(self) -> None:
+        """Build (sample_idx, centre_x, centre_y | None) list for one epoch."""
+        n_fg = int(self.epoch_size * self.fg_ratio)
+        n_bg = self.epoch_size - n_fg
+
+        rng = np.random.default_rng()
+
+        epoch: list[tuple[int, int | None, int | None]] = []
+
+        # foreground entries
+        chosen_fg = rng.choice(len(self._fg_index), size=n_fg, replace=True)
+        for ci in chosen_fg:
+            s_idx, p_idx = self._fg_index[ci]
+            _, pts = self._polygons[s_idx][p_idx]
+            cx = int(pts[:, 0].mean())
+            cy = int(pts[:, 1].mean())
+            epoch.append((s_idx, cx, cy))
+
+        # background entries (random crop from any image)
+        chosen_bg = rng.integers(0, len(self._samples), size=n_bg)
+        for s_idx in chosen_bg:
+            epoch.append((int(s_idx), None, None))
+
+        rng.shuffle(epoch)
+        self._epoch_index = epoch
+
+    # ------------------------------------------------------------------
+    def __len__(self) -> int:
+        return self.epoch_size
+
+    # ------------------------------------------------------------------
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        s_idx, hint_cx, hint_cy = self._epoch_index[idx]
+        img_path, lbl_path = self._samples[s_idx]
+
+        image_bgr = cv2.imread(str(img_path))
+        if image_bgr is None:
+            raise RuntimeError(f"Cannot read image: {img_path}")
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        img_h, img_w = image_rgb.shape[:2]
+
+        mask = yolo_polygons_to_semantic_mask(
+            self._polygons[s_idx], img_h, img_w
+        )
+        image_rgb = apply_clahe_gamma(image_rgb)
+
+        # Determine patch centre
+        half = self.half
+        if hint_cx is not None:
+            cx = int(np.clip(hint_cx, half, img_w - half))
+            cy = int(np.clip(hint_cy, half, img_h - half))
+        else:
+            cx = int(np.random.randint(half, max(half + 1, img_w - half)))
+            cy = int(np.random.randint(half, max(half + 1, img_h - half)))
+
+        x1, y1 = cx - half, cy - half
+        x2, y2 = x1 + self.PATCH_SIZE, y1 + self.PATCH_SIZE
+
+        img_patch  = image_rgb[y1:y2, x1:x2]
+        mask_patch = mask[y1:y2, x1:x2]
+
+        if self.transform is not None:
+            transformed = self.transform(image=img_patch, mask=mask_patch)
+            img_patch  = transformed["image"]
+            mask_patch = transformed["mask"]
+
+        image_tensor = torch.from_numpy(img_patch).permute(2, 0, 1).float() / 255.0
+        mask_tensor  = torch.from_numpy(mask_patch).long()
+        return image_tensor, mask_tensor
+
+
 if __name__ == "__main__":
     dataset = FundusSegmentationDataset(split="train")
     image, mask = dataset[0]
