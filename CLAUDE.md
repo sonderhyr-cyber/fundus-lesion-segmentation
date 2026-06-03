@@ -353,5 +353,34 @@ NOT YET VERIFIED ON AUTODL
 - Verify each step before adding complexity.
 - Prioritize reproducibility.
 - Avoid introducing new architectures before baseline U-Net works.
-- 
+
+---
+
+## Unified Data Pipeline (ENFORCE STRICTLY)
+
+本项目已经存在统一数据管线。
+
+### 禁止
+
+- 新建 dataset loader
+- 新建 train.py
+- 新建 evaluate.py
+- 修改 dataset 目录结构
+- 修改标签格式
+
+### 必须
+
+- 使用 src/dataset.py
+- 使用现有 train pipeline（src/model/train.py）
+- 使用现有 evaluate pipeline（src/model/evaluate.py）
+
+### 允许
+
+- 在 src/model/ 下新增模型文件
+- 在 src/model/loss.py 中新增损失函数
+- 在 requirements.txt 中增加缺失依赖
+
+### 目标
+
+所有模型共享同一套数据集和评价指标，保证实验结果可对比。
 
