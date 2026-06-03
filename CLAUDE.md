@@ -17,8 +17,61 @@ PyTorch
 Development workflow:
 
 - Local development: MacBook Air M4 + VS Code
-- Remote training: AutoDL server
+- Remote training: AutoDL server (A100-PCIE-40GB × 1)
 - SSH connected to VS Code
+
+---
+
+## Environment & Infrastructure
+
+### Local Machine
+
+| 项目 | 路径 |
+|------|------|
+| 项目根目录 | `/Users/sonder/Desktop/fundus-lesion-segmentation` |
+| 数据集根目录 | `/Users/sonder/Desktop/fundus-lesion-segmentation/dataset/Segmentation` |
+| outputs 目录 | `/Users/sonder/Desktop/fundus-lesion-segmentation/outputs` |
+
+### AutoDL 服务器
+
+| 项目 | 值 |
+|------|-----|
+| SSH 连接指令 | `ssh -p 32246 root@region-9.autodl.pro` |
+| GPU | A100-PCIE-40GB × 1 |
+| 项目根目录 | `/root/fundus-lesion-segmentation` |
+| 数据集根目录 | `/root/fundus-lesion-segmentation/dataset/Segmentation` |
+| outputs 目录 | `/root/fundus-lesion-segmentation/outputs` |
+
+### GitHub 仓库
+
+```
+https://github.com/sonderhyr-cyber/fundus-lesion-segmentation
+```
+
+### 标准工作流（每次改代码后）
+
+```bash
+# 本地：提交并推送
+git add <改动的文件>
+git commit -m "描述"
+git push
+
+# AutoDL：拉取并执行
+# 先 SSH 登录：ssh -p 32246 root@region-9.autodl.pro
+cd /root/fundus-lesion-segmentation
+git pull
+python <脚本路径>
+```
+
+### Terminal 指令规范
+
+**所有给用户的终端指令必须满足以下要求：**
+
+1. 本地指令从项目根目录 `/Users/sonder/Desktop/fundus-lesion-segmentation` 出发
+2. AutoDL 指令从 `/root/fundus-lesion-segmentation` 出发
+3. 指令必须可以直接复制粘贴执行，不需要用户手动替换任何变量
+4. 如果需要先 SSH 登录，第一行必须写明：`ssh -p 32246 root@region-9.autodl.pro`
+5. 后台运行时 log 统一输出到 `outputs/<模块名>/logs/stdout.log`
 
 ---
 
