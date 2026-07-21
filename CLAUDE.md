@@ -1,24 +1,28 @@
-# CLAUDE[.md](http://CONTEXT.md)
+# CLAUDE.md
+
+> 最后更新：2026-07-21（暑期冲刺启动）
 
 ## Project Overview
 
-Project Name:  
-Fundus Lesion Segmentation using U-Net
+**项目名称：** Fundus Lesion Segmentation（眼底病灶分割）
 
-Goal:  
-Train a semantic segmentation model for retinal lesion segmentation on fundus images.
+**目标：** 一个月内做出**可发表成果**。以 HRDecoder（MICCAI 2024）为骨干，针对微小病灶（MA/SE）提出改进模块与尺寸感知损失，在 DDR + IDRiD 上做完整对比与消融。
 
-Current baseline model:  
-U-Net
+**框架：** PyTorch
 
-Framework:  
-PyTorch
+**主指标：** **mAUPR**（逐病灶 PR 曲线下面积）—— 本领域标准，**不是 IoU**
 
-Development workflow:
+**开发流程：**
+- 本地开发：MacBook Air M4 + VS Code
+- 远程训练：AutoDL（A100-PCIE-40GB × 1）
+- VS Code 通过 SSH 连接
 
-- Local development: MacBook Air M4 + VS Code
-- Remote training: AutoDL server (A100-PCIE-40GB × 1)
-- SSH connected to VS Code
+**角色分工：**
+
+| 角色 | 负责内容 |
+|---|---|
+| **B（用户，同时是负责人）** | 统一评测脚本、M2MRF 复现、重算旧基线、产出【表 1】；并独立验收 A 的交付 |
+| **A（另一位同学）** | 官方数据划分、HRDecoder 复现、实验框架 |
 
 ---
 
@@ -48,16 +52,19 @@ Development workflow:
 https://github.com/sonderhyr-cyber/fundus-lesion-segmentation
 ```
 
+> 注：曾创建过 `fundus-seg-2026` 备用仓库，**现已弃用**，一切以本仓库为准。
+
 ### 标准工作流（每次改代码后）
 
 ```bash
 # 本地：提交并推送
+cd /Users/sonder/Desktop/fundus-lesion-segmentation
 git add <改动的文件>
 git commit -m "描述"
 git push
 
 # AutoDL：拉取并执行
-# 先 SSH 登录：ssh -p 32246 root@region-9.autodl.pro
+ssh -p 32246 root@region-9.autodl.pro
 cd /root/fundus-lesion-segmentation
 git pull
 python <脚本路径>
@@ -65,375 +72,156 @@ python <脚本路径>
 
 ### Terminal 指令规范
 
-**所有给用户的终端指令必须满足以下要求：**
+**所有给用户的终端指令必须满足：**
 
-1. 本地指令从项目根目录 `/Users/sonder/Desktop/fundus-lesion-segmentation` 出发
+1. 本地指令从 `/Users/sonder/Desktop/fundus-lesion-segmentation` 出发
 2. AutoDL 指令从 `/root/fundus-lesion-segmentation` 出发
-3. 指令必须可以直接复制粘贴执行，不需要用户手动替换任何变量
-4. 如果需要先 SSH 登录，第一行必须写明：`ssh -p 32246 root@region-9.autodl.pro`
-5. 后台运行时 log 统一输出到 `outputs/<模块名>/logs/stdout.log`
+3. 可直接复制粘贴执行，不需手动替换变量
+4. 需要 SSH 时第一行必须写明：`ssh -p 32246 root@region-9.autodl.pro`
+5. 后台运行 log 统一输出到 `outputs/<模块名>/logs/stdout.log`
 
 ---
 
 ## Dataset Information
 
-Dataset root:
+**数据集：** DDR（Diabetic Retinopathy Dataset），分割子集共 757 张。
 
-dataset/Segmentation
+```
+dataset/
+├── Segmentation/          ← 本月唯一使用
+│   ├── images/{train,valid,test}/
+│   └── labels/{train,valid,test}/
+├── Grading/               （分类任务，本月冻结）
+├── Detection/             （本月冻结）
+└── best_segmentation/     （IDRiD 类数据，第 3 周泛化实验可能用）
+```
 
-Structure:
+**标签格式：** YOLO segmentation，`class_id x1 y1 x2 y2 ...`，坐标已归一化。
 
-dataset/  
-└── Segmentation/  
-├── images/  
-│ ├── train/  
-│ ├── valid/  
-│ └── test/  
-└── labels/  
-├── train/  
-├── valid/  
-└── test/
+| 原始类别 | MA | HE | EX | SE |
+|---|---|---|---|---|
+| class_id | 0 | 1 | 2 | 3 |
 
-YOLO segmentation format:
+**语义分割映射：**
 
-class_id x1 y1 x2 y2 ...
+| 标签 | 0 | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|---|
+| 含义 | background | MA | HE | EX | SE |
 
-Coordinates are normalized.
+`NUM_CLASSES = 5`
 
-Original classes:
+### ⚠️ 数据划分现状（第 1 周必须解决）
 
-MA -> 0  
-HE -> 1  
-EX -> 2  
-SE -> 3
+| | 本地现状 | 官方标准（文献口径） |
+|---|---|---|
+| train | **338** | **383** |
+| valid | 149 | 149 |
+| test | **208** | **225** |
 
-Semantic segmentation mapping:
+**缺失的 45 张训练图 + 17 张测试图本地不存在**（已解压的 `dataset/` 与曾经的 `dataset.zip` 均为 338/149/208），**必须重新从 DDR 官方源下载补齐**。
 
-background -> 0  
-MA -> 1  
-HE -> 2  
-EX -> 3  
-SE -> 4
+> 用非官方划分 = 结果无法与任何论文对比 = 不可发表。这是第 1 周的头号前置任务。
 
-Number of classes:
+### 类别不均衡（核心难点）
 
-NUM_CLASSES = 5
+各病灶多边形标注数量（训练集）：MA 9869 / HE 11443 / EX 21566 / **SE 1207**
+
+MA 最难：仅占训练像素约 0.037%，背景:MA ≈ 2712:1。
 
 ---
 
 ## Completed Work
 
-### 1. Data parsing
-
-Implemented:
-
-parse_yolo_segmentation()
-
-Successfully converts YOLO polygon annotations into polygon coordinates.
-
-Verified.
-
----
-
-### 2. Mask generation
-
-Implemented:
-
-yolo_polygons_to_semantic_mask()
-
-Uses OpenCV fillPoly().
-
-Verified.
-
-Mask labels:
-
-0 background  
-1 MA  
-2 HE  
-3 EX  
-4 SE
+1. **数据解析** `parse_yolo_segmentation()` — YOLO 多边形 → 坐标，已验证
+2. **掩膜生成** `yolo_polygons_to_semantic_mask()` — OpenCV `fillPoly()`，已验证
+3. **可视化** — 原图 / mask / overlay，人工检查通过，标注与病灶对齐
+4. **Dataset** `FundusSegmentationDataset` — 返回 `[3,512,512]` 图像与 `[512,512]` 掩膜
+5. **DataLoader** — batch_size=4，输出 `[B,3,512,512]` / `[B,512,512]`
+6. **图像缩放** — 统一 512×512；图像 `cv2.INTER_LINEAR`，**掩膜 `cv2.INTER_NEAREST`（严禁修改）**
+7. **U-Net** — 编码 64→1024，解码 1024→64，输出 `[5,512,512]`，约 31M 参数
+8. **损失函数** — `src/model/loss.py` 已实现 FocalTverskyLoss / DiceLoss / DiceCELoss
+9. **前景偏置 Patch 采样** — 每 epoch 1500 个 patch，80% 前景 / 20% 随机背景
+10. **SMP 基线** — `src/baselines/smp/`，ResNet34 + ImageNet 预训练
+11. **M2MRF 复现** — `src/models/m2mrf/`，配置 `configs/m2mrf.yaml`
+12. **HRDecoder 复现** — `src/baselines/hrdecoder/`，配置 `configs/hrdecoder.yaml`
 
 ---
 
-### 3. Visualization
+## Current Status（真实结果）
 
-Completed:
+| 模型 | 验证集 mIoU | 测试集 mIoU | 备注 |
+|---|---|---|---|
+| 自建 U-Net（从零） | 0.057 | 0.096 | SE 类 IoU=0，仅作最低基线 |
+| SMP U-Net (ResNet34) | 0.107 | 0.121 | 自建线最好 |
+| MMSeg 复现线 | — | mIoU 28.51 / **mAUPR 44.23** | **尚未复现到已发表水平** |
 
-- image visualization
-- mask visualization
-- overlay visualization
+**已有权重：** `outputs/checkpoints/best_model.pth`（119M，自建 U-Net）
 
-Manual inspection passed.
+### SOTA 坐标（DDR 测试集，官方划分）
 
-Labels align correctly with lesions.
+| 方法 | mAUPR | mDice | mIoU |
+|---|---|---|---|
+| M2MRF (PR 2022) | ~51.1 | ~49.2 | ~38.1 |
+| MLNet (2024) | 51.81 | 49.85 | 37.19 |
+| HRDecoder (MICCAI 2024) | ~52–53 | — | ~37–38 |
 
----
-
-### 4. Dataset
-
-Implemented:
-
-FundusSegmentationDataset
-
-Returns:
-
-image tensor:  
-[3, 512, 512]
-
-mask tensor:  
-[512, 512]
-
-Verified.
+**差距 = 我们 44% vs 已发表 51–53%，第 1 周补齐这 ~8 个点。**
 
 ---
 
-### 5. DataLoader
+## Important Project Rules（铁律）
 
-Verified.
-
-Current configuration:
-
-batch_size = 4
-
-Output:
-
-images:  
-[B,3,512,512]
-
-masks:  
-[B,512,512]
-
-Works correctly.
+1. **只做 DDR 分割这一条线**，本月冻结 YOLO 分类/分级（那是另一篇论文）。
+2. **数据必须用官方划分 383/149/225。**
+3. **主指标 mAUPR**（附 mDice、mIoU），口径对齐 M2MRF/HRDecoder 论文。
+4. **AUPR 必须用 softmax 概率图计算，严禁用 argmax。**
+5. **先复现、再创新。** 复现未达标前不引入任何新模型/新模块。
+6. **掩膜插值 `cv2.INTER_NEAREST` 严禁修改。**
+7. 一律使用相对路径 + `pathlib.Path`，**禁止硬编码** `/Users/...`、`D:/`、`C:/`。
+8. 保持 AutoDL 兼容；输出进 `outputs/`，权重进 `outputs/checkpoints/`。
+9. 完整训练放 AutoDL（A100），本地只做冒烟测试。
+10. **每次实验必须登记实验台账**（`docs/experiments.csv`）。
 
 ---
 
-### 6. Image resizing
+## Unified Data Pipeline（ENFORCE STRICTLY）
 
-Important:
+本项目已有统一数据管线，所有模型共享同一套数据与评价指标，保证实验可对比。
 
-Original images have inconsistent sizes.
+**禁止：** 新建 dataset loader / 新建 `train.py` / 新建 `evaluate.py` / 修改 dataset 目录结构 / 修改标签格式
 
-Resolved by resizing all samples to:
+**必须：** 使用 `src/dataset.py`、`src/model/train.py`、`src/model/evaluate.py`
 
-512 x 512
-
-Image interpolation:
-
-cv2.INTER_LINEAR
-
-Mask interpolation:
-
-cv2.INTER_NEAREST
-
-Do NOT change mask interpolation.
+**允许：** 在 `src/model/`、`src/models/` 下新增模型文件；在 `src/model/loss.py` 新增损失；在 `requirements.txt` 增补依赖
 
 ---
 
-### 7. U-Net
-
-Implemented.
-
-Current architecture:
-
-Input:  
-[3,512,512]
-
-Encoder:  
-64 -> 128 -> 256 -> 512 -> 1024
-
-Decoder:  
-1024 -> 512 -> 256 -> 128 -> 64
-
-Output:  
-[5,512,512]
-
-Approximate parameters:
-
-31M
-
-Potential future optimization:
-
-base_channels = 32
-
-to reduce model size.
-
----
-
-## Current Status
-
-Training pipeline exists.
-
-[train.py](http://train.py) implemented.
-
-Configuration:
-
-Optimizer:  
-Adam
-
-Learning rate:  
-1e-3
-
-Loss:  
-CrossEntropyLoss
-
-Epochs:  
-5
-
-Batch size:  
-4
-
-Model checkpoint:
-
-outputs/best_model.pth
-
-Not fully trained yet.
-
----
-
-## Known Issues
-
-### Class imbalance
-
-Dataset is highly imbalanced.
-
-Approximate lesion counts:
-
-MA: 9869  
-HE: 11443  
-EX: 21566  
-SE: 1207
-
-Future work:
-
-- Dice Loss
-- Weighted CrossEntropy
-- Focal Loss
-- Dice + CE hybrid loss
-
-Need experimentation.
-
----
-
-## Important Project Rules
-
-1. Always use relative paths.
-
-Never hardcode:
-
-/Users/...
-
-D:/...
-
-C:/...
-
-1. Use pathlib.Path.
-2. Keep AutoDL compatibility.
-3. Save outputs into:
-
-outputs/
-
-1. Save checkpoints into:
-
-outputs/checkpoints/
-
----
-
-## Immediate Next Tasks
-
-Priority 1
-
-Verify training on AutoDL.
-
-Tasks:
-
-- upload dataset
-- install requirements
-- run [train.py](http://train.py)
-- confirm loss decreases
-
-Priority 2
-
-Implement metrics:
-
-- Dice
-- IoU
-
-Priority 3
-
-Implement [predict.py](http://predict.py)
-
-Generate:
-
-- original image
-- ground truth mask
-- predicted mask
-- overlay
-
-Priority 4
-
-Integrate Weights & Biases (wandb)
-
-Track:
-
-- train loss
-- validation loss
-- Dice
-- IoU
-
----
-
-## What Has Been Verified
-
-Dataset: PASS
-
-DataLoader: PASS
-
-Mask generation: PASS
-
-Visualization: PASS
-
-U-Net forward pass: PASS
-
-Training loop:  
-NOT YET VERIFIED ON AUTODL
+## Immediate Next Tasks（第 0–1 周）
+
+详见 `docs/新Session工作指南-第0与第1周.md`。
+
+**第 0 周（开工准备）**
+- 提交当前未跟踪的代码（configs/、src/models/、src/baselines/hrdecoder/ 等）
+- AutoDL 环境自检；建实验台账；建 `sprint-week1` 分支
+- 与 A 对齐分工与红线
+
+**第 1 周（对齐口径 + 复现基线）**
+- **T1.0** 重新下载 DDR 官方数据，补齐 383/149/225 ← 头号前置
+- **T1.1**【A】固化官方划分，`dataset.py` 读取划分清单
+- **T1.2**【B】升级 `evaluate.py`：mAUPR（概率图）+ mDice + mIoU
+- **T1.3**【A】HRDecoder 复现到已发表 ±1% ← 本周锚点
+- **T1.4**【B】M2MRF 第二基线
+- **T1.5**【B】用新脚本重算旧基线
+- **T1.6**【B】产出【表 1】统一口径对比表
+
+**红线：** HRDecoder 未复现到 ±1%，不得进入第 2 周。
 
 ---
 
 ## Preferred Development Style
 
-- Keep code simple.
-- Make minimal changes.
-- Verify each step before adding complexity.
-- Prioritize reproducibility.
-- Avoid introducing new architectures before baseline U-Net works.
-
----
-
-## Unified Data Pipeline (ENFORCE STRICTLY)
-
-本项目已经存在统一数据管线。
-
-### 禁止
-
-- 新建 dataset loader
-- 新建 train.py
-- 新建 evaluate.py
-- 修改 dataset 目录结构
-- 修改标签格式
-
-### 必须
-
-- 使用 src/dataset.py
-- 使用现有 train pipeline（src/model/train.py）
-- 使用现有 evaluate pipeline（src/model/evaluate.py）
-
-### 允许
-
-- 在 src/model/ 下新增模型文件
-- 在 src/model/loss.py 中新增损失函数
-- 在 requirements.txt 中增加缺失依赖
-
-### 目标
-
-所有模型共享同一套数据集和评价指标，保证实验结果可对比。
-
+- 代码保持简单，改动最小化
+- 每一步验证通过再加复杂度
+- 优先保证可复现性
+- 基线未跑通前不引入新架构
+- 不轻信口头数字，一切以负责人用统一脚本复算的结果为准

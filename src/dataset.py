@@ -113,10 +113,31 @@ class FundusSegmentationDataset(Dataset):
         root: str | Path = DATA_ROOT,
         split: str = "train",
         transform=None,
+        native_mask: bool = False,
     ) -> None:
+        """
+        Args:
+            native_mask: if True, the returned mask keeps the image's ORIGINAL
+                resolution (no 512x512 resize) while the image tensor is still
+                resized to 512x512 for the network. This is the evaluation
+                protocol used by M2MRF / HRDecoder: predictions are upsampled
+                back to the original resolution before metrics are computed,
+                so that micro-lesions (MA) are not destroyed by downsampling.
+
+                NOTE: masks then have varying shapes across samples, so a
+                DataLoader using this mode MUST use batch_size=1 (the default
+                collate cannot stack ragged tensors).
+        """
         self.root = Path(root)
         self.split = split
         self.transform = transform
+        self.native_mask = native_mask
+
+        if native_mask and transform is not None:
+            raise ValueError(
+                "native_mask=True is for evaluation only and cannot be combined "
+                "with a transform (image and mask no longer share a shape)."
+            )
 
         image_dir = self.root / "images" / split
         label_dir = self.root / "labels" / split
@@ -143,6 +164,15 @@ class FundusSegmentationDataset(Dataset):
 
         image_rgb = apply_clahe_gamma(image_rgb)
         image_rgb = cv2.resize(image_rgb, IMAGE_SIZE, interpolation=cv2.INTER_LINEAR)
+
+        if self.native_mask:
+            # Evaluation protocol: keep GT at original resolution.
+            # The model still sees a 512x512 input; evaluate.py upsamples the
+            # logits back to (img_h, img_w) before computing metrics.
+            image_tensor = torch.from_numpy(image_rgb).permute(2, 0, 1).float() / 255.0
+            mask_tensor = torch.from_numpy(mask).long()
+            return image_tensor, mask_tensor
+
         mask = cv2.resize(mask, IMAGE_SIZE, interpolation=cv2.INTER_NEAREST)
 
         if self.transform is not None:

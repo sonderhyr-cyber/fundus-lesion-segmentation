@@ -24,3 +24,10 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Large binary deliverables (keep local, not in git)
+midterm/
+*.xlsx
+
+# Local Claude settings
+.claude/settings.local.json
