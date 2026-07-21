@@ -1,0 +1,53 @@
+# M2MRF training configuration
+# Paper: "Automated Lesion Segmentation in Fundus Images with
+#         Many-to-Many Reassembly of Features"
+# Source: https://github.com/CVIU-CSU/M2MRF-Lesion-Segmentation
+#
+# Run: python train.py --model m2mrf
+
+model:
+  name: m2mrf
+  num_classes: 5
+
+  # M2MRF variant: A (one-step down + one-step up)
+  #               B (one-step down + cascade up)
+  #               C (cascade down + one-step up)
+  #               D (cascade down + cascade up)
+  #               base (standard HRNet fuse — no M2MRF)
+  variant: A
+
+  # HRNet-W18-Small channel widths (trains from scratch, ~7 M params)
+  # For higher capacity use W30 [30,60,120,240] or W48 [48,96,192,384]
+  stage2_channels: [18, 36]
+  stage3_channels: [18, 36, 72]
+  stage4_channels: [18, 36, 72, 144]
+
+  # M2MRF module hyper-parameters (paper defaults for W48; kept as-is for W18)
+  m2mrf_patch_size: [8, 8]            # [patch_size_down, patch_size_up]
+  m2mrf_encode_channels_rate: 4       # channel compression ratio inside M2MRF
+  m2mrf_fc_channels_rate: 64          # 1-D FC bottleneck ratio
+
+training:
+  batch_size: 4
+  epochs: 100
+  learning_rate: 3.0e-4
+  epoch_size: 1500          # patches sampled per epoch (ForegroundPatchDataset)
+  fg_ratio: 0.8             # fraction of foreground-centred patches
+
+  optimizer: adam
+  scheduler: reduce_on_plateau
+  scheduler_factor: 0.5
+  scheduler_patience: 5
+
+  early_stop_patience: 20
+  reset_training: true
+
+loss:
+  name: focal_tversky       # same loss as UNet baseline for fair comparison
+  alpha: 0.3
+  beta: 0.7
+  gamma: 0.75
+
+checkpoint:
+  dir: outputs/checkpoints
+  filename: m2mrf_best.pth

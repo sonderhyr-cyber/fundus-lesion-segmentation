@@ -1,0 +1,42 @@
+# HRDecoder training configuration
+# Reproduces: HRDecoder (MICCAI 2024) on the Fundus Lesion Segmentation dataset.
+# Paper: https://github.com/CVIU-CSU/HRDecoder
+#
+# Run: python train.py --model hrdecoder
+
+model:
+  name: hrdecoder
+  num_classes: 5
+  pretrained: true
+  # HR training settings (paper values, adapted to 512×512 input)
+  hr_scale: [512, 512]       # original paper: [1024,1024] for 2048px images
+  scale_ratio: [0.75, 1.25]  # random scale ratio for HR crop size
+  hr_loss_weight: 0.1        # auxiliary HR loss weight
+  crop_num: 2                # number of HR crops per training step
+  divisible: 8               # crop dimensions must be divisible by this
+
+training:
+  batch_size: 4
+  epochs: 100
+  learning_rate: 3.0e-4
+  epoch_size: 1500           # patches sampled per epoch (ForegroundPatchDataset)
+  fg_ratio: 0.8              # fraction of foreground-centred patches
+
+  optimizer: adam
+  scheduler: reduce_on_plateau
+  scheduler_factor: 0.5
+  scheduler_patience: 5
+
+  early_stop_patience: 20
+  reset_training: true
+
+loss:
+  name: focal_tversky        # same loss as UNet baseline for fair comparison
+  alpha: 0.3
+  beta: 0.7
+  gamma: 0.75
+
+checkpoint:
+  # Saved to outputs/checkpoints/hrdecoder_best.pth
+  dir: outputs/checkpoints
+  filename: hrdecoder_best.pth
