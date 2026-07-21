@@ -159,13 +159,24 @@ MA 最难：仅占训练像素约 0.037%，背景:MA ≈ 2712:1。
 
 ### SOTA 坐标（DDR 测试集，官方划分）
 
-| 方法 | mAUPR | mDice | mIoU |
-|---|---|---|---|
-| M2MRF (PR 2022) | ~51.1 | ~49.2 | ~38.1 |
-| MLNet (2024) | 51.81 | 49.85 | 37.19 |
-| HRDecoder (MICCAI 2024) | ~52–53 | — | ~37–38 |
+> **2026-07-21 修正：** 原表格中 M2MRF / HRDecoder 的数字有误（疑似与 MLNet 自身结果及
+> HRDecoder 论文 IDRiD 列混淆），已用三个独立信源交叉核实改正，见下方来源说明。
 
-**差距 = 我们 44% vs 已发表 51–53%，第 1 周补齐这 ~8 个点。**
+| 方法 | mAUPR | mDice/mF | mIoU | 来源 |
+|---|---|---|---|---|
+| M2MRF-A (PR 2022) | 49.56 | — | 31.47 | [官方 GitHub](https://github.com/CVIU-CSU/M2MRF-Lesion-Segmentation) 自报（DDR） |
+| M2MRF (HRDecoder 复现) | 49.12 | 46.11 | 30.72 | HRDecoder 论文 Table 1，相同 protocol 独立复现 |
+| HRDecoder (MICCAI 2024) | 49.27 | 48.21 | 32.25 | [论文](https://arxiv.org/abs/2411.03976) Table 1/2，DDR test，三次重复均值 |
+| MLNet (Algorithms 2024) | 51.81 | 49.85 | 37.19 | [论文](https://doi.org/10.3390/a17040164) 摘要原话，DDR |
+
+三个来源互相印证：M2MRF 官方仓库（49.56/31.47）、HRDecoder 论文独立复现的 M2MRF
+（49.12/30.72）、以及 MLNet 论文正文按"比次优方法高 1.87% mAUPR / 6.92% mIoU"反推出的
+M2MRF（≈49.9/≈30.3）——三者高度吻合。**HRDecoder 在 DDR 上的真实已发表成绩是
+mAUPR 49.27 / mIoU 32.25，不是之前记录的 52–53。** MLNet 是唯一站上 51.81% 的方法，且它
+发表早于 HRDecoder，双方未直接对比过。
+
+**差距 = 我们 44.23% vs HRDecoder 已发表 49.27%，第 1 周要补齐的是 ~5 个点，不是 ~8 个。**
+**T1.3 的 ±1% 红线目标相应改为 49.27% mAUPR（对齐 HRDecoder，而非 MLNet 的 51.81%）。**
 
 ---
 
