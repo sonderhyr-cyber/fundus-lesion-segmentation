@@ -5,13 +5,18 @@
 > 任何结果直接对比（官方划分同配置复跑 test mIoU ≈ 30.8%，6:1:3 为 42.2%，差异来源是
 > 训练数据 +18.5% 与测试集病灶构成不同）。
 
-## checkpoint 下载
+## checkpoint 下载（分周）
 
-**Google Drive（主）**：https://drive.google.com/file/d/1dPWfCVqdX-pa9-tR6TZXwdV4rL_cG6lq/view?usp=sharing
-（7 个 best checkpoint 打包，文件名带实验名前缀：e4_detail / e1v2_cedice / combo_e4_cedice /
-e2e3_fuse_aspp / e4v2_detail_aux / combo_v2 / combo2）
+| 周 | 位置 | 链接 |
+|---|---|---|
+| **week1** | Google Drive | https://drive.google.com/file/d/1dPWfCVqdX-pa9-tR6TZXwdV4rL_cG6lq/view?usp=sharing |
+| **week2** | GitHub Release | https://github.com/a1553846342-dotcom/fundus-seg-2026/releases/tag/hrdecoder-ddgr-exp-2026-08 |
 
-**GitHub Release（备选）**：https://github.com/a1553846342-dotcom/fundus-seg-2026/releases/tag/hrdecoder-ddgr-exp-2026-08
+week2 Release 内含 7 个 best checkpoint，文件名带实验名前缀：
+`e4_detail_best_mIoU_iter_36000.pth`、`e1v2_cedice_best_mIoU_iter_12000.pth`、
+`combo_e4_cedice_best_mIoU_iter_32000.pth`、`e2e3_fuse_aspp_best_mIoU_iter_20000.pth`、
+`e4v2_detail_aux_best_mIoU_iter_36000.pth`、`combo_v2_best_mIoU_iter_16000.pth`（中断，对应 week2 实验）、
+`combo2_best_mIoU_iter_12000.pth`（中断）。
 
 ## 目录结构
 
