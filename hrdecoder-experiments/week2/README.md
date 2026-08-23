@@ -17,17 +17,18 @@ e2e3_fuse_aspp / e4v2_detail_aux / combo_v2 / combo2）
 
 ```
 hrdecoder-experiments/
-├── README.md                本文件
-├── REPORT.md                实验报告（全实验对比表、结论、机制分析）
 ├── week1/                   第一周：板块一（划分+baseline）/ 板块二（SE 增强）/ 板块三（loss 加权）
 │   ├── baseline_report.md   板块一：6:1:3 划分统计 + baseline 复现（mIoU 42.20 / mAUPR 60.59）
 │   ├── module2_3_report.md  板块二/三：SE copy-paste、滑窗过采样、loss 权重的全部负结果
 │   ├── scripts/             划分脚本 ddr_split.py、baseline 配置、se_aug.py、滑窗 HRDecoder、
 │   │                        各 loss 加权配置、报告生成脚本
 │   └── logs/                9 份第一周训练日志 json（baseline/②③④/1.5x/2x/3x/自适应）
-├── logs/                    本批实验（E1~E4v2 系列）8 份 mmcv 训练日志 json
-├── evals/                   各实验 test/val 评估文本与 PR/阈值分析 json
-└── code/                    全部实验配置（configs/）+ 核心代码改动（mmseg/）+ 总补丁
+└── week2/                   第二周：本批提升实验（E1~E4v2 系列，即本目录）
+    ├── README.md            本文件
+    ├── REPORT.md            实验报告（全实验对比表、结论、机制分析）
+    ├── logs/                8 份 mmcv 训练日志 json（E4/E1v2/COMBO×2/E2E3/E4v2/COMBO-v2/combo2）
+    ├── evals/               各实验 test/val 评估文本与 PR/阈值分析 json
+    └── code/                全部实验配置（configs/）+ 核心代码改动（mmseg/）+ 总补丁
                              （exp_improve_all_changes.patch），详见 code/README.md
 ```
 
