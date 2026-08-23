@@ -56,7 +56,12 @@
 
 ## 5. 文件清单
 
-- `logs/`：各实验 mmcv 训练日志 json（E4/E1v2/COMBO×2/COMBO-v2/combo2）
+- `logs/`：各实验 mmcv 训练日志 json（E4/E1v2/COMBO×2/E2E3/E4v2/COMBO-v2/combo2，共 8 份）
 - `evals/`：各实验 test/val 评估文本与 PR 分析 json
-- `checkpoints/`（Release 附件）：5 个 best checkpoint（E4/E1v2/COMBO/COMBO-v2/combo2）
-- 完整实验日志：`EXPERIMENT_LOG.md`（仓库外，随 code 仓库 exp/improve 分支）
+- `code/`：全部实验配置（configs/）+ 核心代码改动（mmseg/）+ 总补丁
+  （`exp_improve_all_changes.patch`）；详见 `code/README.md`
+- `checkpoints/`（GitHub Release `hrdecoder-ddgr-exp-2026-08` 附件，7 个 best checkpoint，
+  文件名为实验名前缀）：`e4_detail_best_mIoU_iter_36000.pth`、`e1v2_cedice_best_mIoU_iter_12000.pth`、
+  `combo_e4_cedice_best_mIoU_iter_32000.pth`、`e2e3_fuse_aspp_best_mIoU_iter_20000.pth`、
+  `e4v2_detail_aux_best_mIoU_iter_36000.pth`、`combo_v2_best_mIoU_iter_16000.pth`（中断）、
+  `combo2_best_mIoU_iter_12000.pth`（中断）
