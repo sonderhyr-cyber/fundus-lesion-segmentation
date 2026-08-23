@@ -1,0 +1,970 @@
+﻿From c4364828535dfe29fd60fd4eb87474e367157433 Mon Sep 17 00:00:00 2001
+From: a1553846342-dotcom <a1553846342@gmail.com>
+Date: Mon, 17 Aug 2026 00:17:52 +0800
+Subject: [PATCH 1/5] exp/improve: E1 Tversky loss config, E2 learnable LR/HR
+ logit fusion, E3 ASPP-lite decoder context, E4 full-res detail branch+head;
+ split613 experiment configs
+
+---
+ configs/lesion/exp/baseline_split613.py   | 57 +++++++++++++++++++
+ configs/lesion/exp/e1_tversky_split613.py | 22 ++++++++
+ configs/lesion/exp/e2_fuse_split613.py    | 18 ++++++
+ configs/lesion/exp/e3_context_split613.py | 19 +++++++
+ configs/lesion/exp/e4_detail_split613.py  | 32 +++++++++++
+ mmseg/models/decode_heads/fcn_head.py     | 17 ++++++
+ mmseg/models/necks/__init__.py            |  6 ++
+ mmseg/models/necks/aspp_context.py        | 61 +++++++++++++++++++++
+ mmseg/models/necks/detail_branch.py       | 67 +++++++++++++++++++++++
+ mmseg/models/segmentors/HRDecoder.py      | 55 +++++++++++++++++--
+ 10 files changed, 350 insertions(+), 4 deletions(-)
+ create mode 100644 configs/lesion/exp/baseline_split613.py
+ create mode 100644 configs/lesion/exp/e1_tversky_split613.py
+ create mode 100644 configs/lesion/exp/e2_fuse_split613.py
+ create mode 100644 configs/lesion/exp/e3_context_split613.py
+ create mode 100644 configs/lesion/exp/e4_detail_split613.py
+ create mode 100644 mmseg/models/necks/aspp_context.py
+ create mode 100644 mmseg/models/necks/detail_branch.py
+
+diff --git a/configs/lesion/exp/baseline_split613.py b/configs/lesion/exp/baseline_split613.py
+new file mode 100644
+index 0000000..5d1f60d
+--- /dev/null
++++ b/configs/lesion/exp/baseline_split613.py
+@@ -0,0 +1,57 @@
++_base_ = [
++    '../../_base_/models/hrdecoder_fcn_hr48.py',
++    '../../_base_/datasets/hr_ddr_2048.py',
++    '../../_base_/default_runtime.py',
++    '../../_base_/schedules/sgd.py',
++    '../../_base_/schedules/poly10warm.py',
++]
++
++# ============================================================
++# exp/baseline_split613.py — control group (identical to 板块一
++# baseline that produced test mIoU 42.20 / mAUPR 60.59).
++# Fixed custom split: DDR_split_613 (train 454 / val 76 / test 227, seed 42).
++# ============================================================
++
++model = dict(
++    type='HRDecoder',
++    hr_settings=dict(
++        hr_scale=(1024, 1024),
++        scale_ratio=(0.75, 1.25),
++        divisible=8,
++        lr_loss_weight=0,
++        hr_loss_weight=0.1,
++        fuse_mode='simple',
++        crop_num=4,
++    ),
++    # single-GPU BN overrides
++    backbone=dict(
++        norm_cfg=dict(type='BN', requires_grad=True)
++    ),
++    decode_head=dict(
++        norm_cfg=dict(type='BN', requires_grad=True)
++    )
++)
++
++data = dict(
++    samples_per_gpu=2,
++    workers_per_gpu=2,
++    train=dict(
++        data_root='./data/DDR_split_613',
++        img_dir='images/train',
++        ann_dir='labels/train'),
++    val=dict(
++        data_root='./data/DDR_split_613',
++        img_dir='images/val',
++        ann_dir='labels/val'),
++    test=dict(
++        data_root='./data/DDR_split_613',
++        img_dir='images/test',
++        ann_dir='labels/test'),
++)
++
++optimizer = dict(type='SGD', lr=0.005, momentum=0.9, weight_decay=0.0005)
++
++seed = 42
++runner = dict(type='IterBasedRunner', max_iters=40000)
++checkpoint_config = dict(by_epoch=False, interval=1000, max_keep_ckpts=1)
++evaluation = dict(interval=4000, metric='mIoU', priority='LOW', save_best='mIoU')
+diff --git a/configs/lesion/exp/e1_tversky_split613.py b/configs/lesion/exp/e1_tversky_split613.py
+new file mode 100644
+index 0000000..3cd7050
+--- /dev/null
++++ b/configs/lesion/exp/e1_tversky_split613.py
+@@ -0,0 +1,22 @@
++_base_ = './baseline_split613.py'
++
++# ============================================================
++# exp/e1_tversky_split613.py — E1: replace per-class Dice with
++# Tversky loss (alpha=0.3 -> beta=0.7, FN-penalizing).
++# Hypothesis: MA/HE recall is limited by the balanced Dice
++# surface; Tversky with beta>alpha pushes the model to reduce
++# false negatives without the class-weight coupling problem
++# that made 板块三 weighting fail.
++# ============================================================
++
++model = dict(
++    decode_head=dict(
++        loss_decode=dict(
++            type='BinaryLoss',
++            loss_type='tversky',
++            loss_weight=1.0,
++            smooth=1e-5,
++            loss_hyper=dict(alpha=0.3),
++        )
++    )
++)
+diff --git a/configs/lesion/exp/e2_fuse_split613.py b/configs/lesion/exp/e2_fuse_split613.py
+new file mode 100644
+index 0000000..b83d922
+--- /dev/null
++++ b/configs/lesion/exp/e2_fuse_split613.py
+@@ -0,0 +1,18 @@
++_base_ = './baseline_split613.py'
++
++# ============================================================
++# exp/e2_fuse_split613.py — E2: learnable LR/HR logit fusion.
++# The official HFF is a hardcoded element-wise average of LR and
++# HR crop logits (fuse_mode is unused in upstream code). We make
++# the fusion weights learnable per class (softmax-normalized,
++# initialized at 0.5/0.5), applied identically in train & test.
++# Hypothesis: the optimal LR/HR trade-off differs per class
++# (e.g. HR crops help tiny MA more than large HE); a learned
++# per-class balance improves both mIoU and mAUPR.
++# ============================================================
++
++model = dict(
++    hr_settings=dict(
++        fuse_mode='learnable',
++    )
++)
+diff --git a/configs/lesion/exp/e3_context_split613.py b/configs/lesion/exp/e3_context_split613.py
+new file mode 100644
+index 0000000..d0b610f
+--- /dev/null
++++ b/configs/lesion/exp/e3_context_split613.py
+@@ -0,0 +1,19 @@
++_base_ = './baseline_split613.py'
++
++# ============================================================
++# exp/e3_context_split613.py — E3: ASPP-lite context module in
++# the FCN decoder head (multi-scale dilated context after the
++# local convs). Addresses the paper's admitted weakness: the
++# simple CNN decoder lacks context modeling.
++# Hypothesis: EX/HE (large lesions) benefit from broader context,
++# reducing boundary over/under-segmentation and false positives.
++# ============================================================
++
++model = dict(
++    decode_head=dict(
++        context_cfg=dict(
++            type='ASPPContext',
++            dilations=(6, 12, 18),
++        )
++    )
++)
+diff --git a/configs/lesion/exp/e4_detail_split613.py b/configs/lesion/exp/e4_detail_split613.py
+new file mode 100644
+index 0000000..47befd8
+--- /dev/null
++++ b/configs/lesion/exp/e4_detail_split613.py
+@@ -0,0 +1,32 @@
++_base_ = './baseline_split613.py'
++
++# ============================================================
++# exp/e4_detail_split613.py — E4: full-resolution detail path.
++# Adds a shallow stride-4 DetailBranch on the ORIGINAL 2048px
++# image (the backbone only sees a 1024px downscale) plus a tiny
++# DetailHead; its logits are added to the fused LR+HR logits
++# with a learnable scalar `detail_scale` initialized at 0
++# (training starts exactly at baseline behavior).
++# Hypothesis: MA (median 48 px^2, below one native logit cell
++# of the LR path) is missed because the detail is destroyed by
++# the 2x downscale; the detail path restores it, raising MA
++# recall / AUPR without hurting larger classes.
++# ============================================================
++
++model = dict(
++    detail_branch=dict(
++        type='DetailBranch',
++        mid_channels=32,
++        out_channels=32,
++        norm_cfg=dict(type='BN', requires_grad=True),
++        act_cfg=dict(type='ReLU'),
++    ),
++    detail_head=dict(
++        type='DetailHead',
++        in_channels=32,
++        mid_channels=32,
++        num_classes=4,
++        norm_cfg=dict(type='BN', requires_grad=True),
++        act_cfg=dict(type='ReLU'),
++    ),
++)
+diff --git a/mmseg/models/decode_heads/fcn_head.py b/mmseg/models/decode_heads/fcn_head.py
+index e9b3cf2..0ae907c 100644
+--- a/mmseg/models/decode_heads/fcn_head.py
++++ b/mmseg/models/decode_heads/fcn_head.py
+@@ -28,12 +28,14 @@ class FCNHead(BaseDecodeHead):
+                  concat_input=True,
+                  dilation=1,
+                  compress=False,
++                 context_cfg=None,
+                  **kwargs):
+         assert num_convs >= 0 and dilation > 0 and isinstance(dilation, int)
+         self.num_convs = num_convs
+         self.concat_input = concat_input
+         self.kernel_size = kernel_size
+         self.compress = compress
++        self.context_cfg = context_cfg
+         super(FCNHead, self).__init__(**kwargs)
+         if num_convs == 0:
+             assert self.in_channels == self.channels
+@@ -88,6 +90,19 @@ class FCNHead(BaseDecodeHead):
+             self.convs = nn.Identity()
+         else:
+             self.convs = nn.Sequential(*convs)
++        # ---- context module (E3): multi-scale context after local convs ----
++        if self.context_cfg is not None:
++            from ..builder import build_neck
++            ctx_cfg = dict(self.context_cfg)
++            ctx_cfg.setdefault('in_channels', self.channels)
++            ctx_cfg.setdefault('out_channels', self.channels)
++            ctx_cfg.setdefault('norm_cfg', self.norm_cfg)
++            ctx_cfg.setdefault('act_cfg', self.act_cfg)
++            ctx_cfg.setdefault('conv_cfg', self.conv_cfg)
++            self.context = build_neck(ctx_cfg)
++        else:
++            self.context = None
++        # -------------------------------------------------------------------
+         if self.concat_input:
+             self.conv_cat = ConvModule(
+                 self.in_channels + self.channels,
+@@ -102,6 +117,8 @@ class FCNHead(BaseDecodeHead):
+         """Forward function."""
+         x = self._transform_inputs(inputs)
+         output = self.convs(x)
++        if self.context is not None:
++            output = self.context(output)
+         if self.concat_input:
+             output = self.conv_cat(torch.cat([x, output], dim=1))
+         output = self.cls_seg(output)
+diff --git a/mmseg/models/necks/__init__.py b/mmseg/models/necks/__init__.py
+index a77a028..c0c302c 100644
+--- a/mmseg/models/necks/__init__.py
++++ b/mmseg/models/necks/__init__.py
+@@ -3,9 +3,15 @@ from .segformer_adapter import SegFormerAdapter
+ from .sam_neck import SAMNeck
+ from .segformer_neck import SegFormerNeck
+ 
++from .aspp_context import ASPPContext
++from .detail_branch import DetailBranch, DetailHead
++
+ 
+ __all__ =[
+     'SegFormerAdapter',
+     'SAMNeck',
+     'SegFormerNeck',
++    'ASPPContext',
++    'DetailBranch',
++    'DetailHead',
+ ]
+diff --git a/mmseg/models/necks/aspp_context.py b/mmseg/models/necks/aspp_context.py
+new file mode 100644
+index 0000000..ccdc659
+--- /dev/null
++++ b/mmseg/models/necks/aspp_context.py
+@@ -0,0 +1,61 @@
++# ASPP-lite context module for FCNHead (E3, exp/improve)
++# Reference: DeepLabV3 ASPP (Chen et al., CVPR 2017) — light adaptation
++# for the HRDecoder simple-CNN decoder to add multi-scale context.
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++from mmcv.cnn import ConvModule
++
++from ..builder import NECKS
++
++
++@NECKS.register_module()
++class ASPPContext(nn.Module):
++    """Multi-scale dilated context module.
++
++    Args:
++        in_channels (int): input channels.
++        out_channels (int): output channels (default 64).
++        dilations (tuple): dilation rates for the 3x3 branches.
++        norm_cfg / act_cfg / conv_cfg: passed to ConvModule.
++    """
++
++    def __init__(self,
++                 in_channels,
++                 out_channels=64,
++                 dilations=(6, 12, 18),
++                 norm_cfg=None,
++                 act_cfg=None,
++                 conv_cfg=None):
++        super(ASPPContext, self).__init__()
++        n_branches = len(dilations) + 2  # 1x1 + dilated 3x3s + image pooling
++        branch_ch = max(8, out_channels // (2 * n_branches)) * 2
++        self.branches = nn.ModuleList()
++        # 1x1 branch
++        self.branches.append(
++            ConvModule(in_channels, branch_ch, 1, conv_cfg=conv_cfg,
++                       norm_cfg=norm_cfg, act_cfg=act_cfg))
++        # dilated 3x3 branches
++        for d in dilations:
++            self.branches.append(
++                ConvModule(in_channels, branch_ch, 3, padding=d, dilation=d,
++                           conv_cfg=conv_cfg, norm_cfg=norm_cfg,
++                           act_cfg=act_cfg))
++        # image pooling branch
++        self.branches.append(
++            ConvModule(in_channels, branch_ch, 1, conv_cfg=conv_cfg,
++                       norm_cfg=norm_cfg, act_cfg=act_cfg))
++        self.pool = nn.AdaptiveAvgPool2d(1)
++        # fuse branches
++        self.fuse = ConvModule(branch_ch * n_branches, out_channels, 1,
++                               conv_cfg=conv_cfg, norm_cfg=norm_cfg,
++                               act_cfg=act_cfg)
++
++    def forward(self, x):
++        feats = [b(x) for b in self.branches[:-1]]
++        pooled = self.branches[-1](self.pool(x))
++        pooled = F.interpolate(pooled, size=x.shape[2:], mode='bilinear',
++                               align_corners=False)
++        feats.append(pooled)
++        return self.fuse(torch.cat(feats, dim=1))
+diff --git a/mmseg/models/necks/detail_branch.py b/mmseg/models/necks/detail_branch.py
+new file mode 100644
+index 0000000..33e9007
+--- /dev/null
++++ b/mmseg/models/necks/detail_branch.py
+@@ -0,0 +1,67 @@
++# E4: DetailBranch + DetailHead (exp/improve)
++# A shallow full-resolution feature path (BiSeNet-style detail branch)
++# that preserves MA-scale detail lost by the 2x downscale in the LR path
++# (HRDecoder resizes the 2048px image to 1024px before the backbone, so
++# the native logit grid is 1/8 of the image and the median MA lesion
++# (48 px^2) is below one logit cell).
++
++import torch.nn as nn
++from mmcv.cnn import ConvModule
++
++from ..builder import HEADS, NECKS
++
++
++@NECKS.register_module()
++class DetailBranch(nn.Module):
++    """Stride-4 shallow stem on the ORIGINAL-resolution image.
++
++    Args:
++        in_channels (int): image channels (3).
++        mid_channels (int): hidden channels (32).
++        out_channels (int): output channels (32).
++        norm_cfg / act_cfg / conv_cfg: passed to ConvModule.
++    """
++
++    def __init__(self,
++                 in_channels=3,
++                 mid_channels=32,
++                 out_channels=32,
++                 norm_cfg=None,
++                 act_cfg=None,
++                 conv_cfg=None):
++        super(DetailBranch, self).__init__()
++        self.stem = nn.Sequential(
++            ConvModule(in_channels, mid_channels, 3, stride=2, padding=1,
++                       conv_cfg=conv_cfg, norm_cfg=norm_cfg, act_cfg=act_cfg),
++            ConvModule(mid_channels, mid_channels, 3, stride=2, padding=1,
++                       conv_cfg=conv_cfg, norm_cfg=norm_cfg, act_cfg=act_cfg),
++            ConvModule(mid_channels, out_channels, 3, stride=1, padding=1,
++                       conv_cfg=conv_cfg, norm_cfg=norm_cfg, act_cfg=act_cfg),
++        )
++
++    def forward(self, x):
++        return self.stem(x)
++
++
++@HEADS.register_module()
++class DetailHead(nn.Module):
++    """Tiny decoder for the detail branch -> per-class logits at stride 4."""
++
++    def __init__(self,
++                 in_channels=32,
++                 mid_channels=32,
++                 num_classes=4,
++                 norm_cfg=None,
++                 act_cfg=None,
++                 conv_cfg=None):
++        super(DetailHead, self).__init__()
++        self.convs = nn.Sequential(
++            ConvModule(in_channels, mid_channels, 3, padding=1,
++                       conv_cfg=conv_cfg, norm_cfg=norm_cfg, act_cfg=act_cfg),
++            ConvModule(mid_channels, mid_channels, 3, padding=1,
++                       conv_cfg=conv_cfg, norm_cfg=norm_cfg, act_cfg=act_cfg),
++        )
++        self.cls = nn.Conv2d(mid_channels, num_classes, 1)
++
++    def forward(self, x):
++        return self.cls(self.convs(x))
+diff --git a/mmseg/models/segmentors/HRDecoder.py b/mmseg/models/segmentors/HRDecoder.py
+index d5c3455..93cf216 100644
+--- a/mmseg/models/segmentors/HRDecoder.py
++++ b/mmseg/models/segmentors/HRDecoder.py
+@@ -4,7 +4,7 @@ import torch.nn as nn
+ import torch.nn.functional as F
+ from mmseg.core import add_prefix
+ from mmseg.ops import resize
+-from ..builder import SEGMENTORS,build_head
++from ..builder import SEGMENTORS,build_head,build_neck
+ from ..decode_heads.segformer_head import MLP
+ from copy import deepcopy
+ from .lesion_encoder_decoder import LesionEncoderDecoder
+@@ -38,10 +38,28 @@ def crop(img, crop_bbox):
+ 
+ @SEGMENTORS.register_module()
+ class HRDecoder(LesionEncoderDecoder):
+-    def __init__(self,hr_settings,**kwargs):
++    def __init__(self,hr_settings,detail_branch=None,detail_head=None,**kwargs):
+         super(HRDecoder,self).__init__(**kwargs)
++        # ---- E4: full-resolution detail path (optional) ----
++        if detail_branch is not None:
++            assert detail_head is not None, 'detail_head required with detail_branch'
++            self.detail_branch = build_neck(detail_branch)
++            self.detail_head = build_head(detail_head)
++            # initialized at 0 -> starts exactly at the baseline (no detail
++            # contribution) and learns to add it during training
++            self.detail_scale = nn.Parameter(torch.tensor(0.0))
++        else:
++            self.detail_branch = None
++            self.detail_head = None
++        # ------------------------------------------------------
+         self._init_hr_settings(hr_settings,kwargs)
+ 
++    def _detail_logits(self, img, img_size):
++        """Detail-path logits at full image size (additive refinement)."""
++        detail_feat = self.detail_branch(img)          # stride 4
++        detail_logit = self.detail_head(detail_feat)
++        return resize(detail_logit, img_size, mode='bilinear')
++
+     def _init_hr_settings(self, hr_settings, kwargs):
+         self.hr_scale=hr_settings.hr_scale
+         self.divisible=hr_settings.get('divisible',8)
+@@ -49,6 +67,29 @@ class HRDecoder(LesionEncoderDecoder):
+         self.lr_loss_weight=hr_settings.get('lr_loss_weight',0)
+         self.crop_num = hr_settings.pop('crop_num', 4)
+         self.scale_ratio = hr_settings.pop('scale_ratio', 1)
++        # ---- E2: learnable LR/HR logit fusion ----
++        self.fuse_mode = hr_settings.pop('fuse_mode', 'simple')
++        if self.fuse_mode == 'learnable':
++            # per-class scalar weights for HR and LR logits (softmax-normalized)
++            self.fuse_hr_w = nn.Parameter(torch.zeros(self.num_classes))
++            self.fuse_lr_w = nn.Parameter(torch.zeros(self.num_classes))
++        else:
++            self.fuse_mode = 'simple'
++
++    def _fuse_logits(self, lr_logit, hr_logit):
++        """Fuse LR (full-size) and HR (crop-size) logits.
++
++        lr_logit / hr_logit have the same spatial size (the crop region).
++        simple: element-wise average (original behavior).
++        learnable: per-class softmax-weighted sum (initialized to 0.5/0.5).
++        """
++        if self.fuse_mode == 'learnable':
++            w = F.softmax(
++                torch.stack([self.fuse_hr_w, self.fuse_lr_w], dim=0), dim=0)
++            w_hr = w[0].view(1, -1, 1, 1)
++            w_lr = w[1].view(1, -1, 1, 1)
++            return w_hr * hr_logit + w_lr * lr_logit
++        return (hr_logit + lr_logit) / 2
+ 
+     def _transform_inputs(self, inputs):
+         upsampled_inputs = [
+@@ -120,7 +161,10 @@ class HRDecoder(LesionEncoderDecoder):
+         fuse_logit = up_lr_logit.clone()
+         for logit,_,bbox in zip(*self.hr_slide_inference(img_size, lr_feat, img_metas).values()):
+                 slc = slice(bbox[0],bbox[1]),slice(bbox[2],bbox[3])
+-                fuse_logit[:,:,slc[0],slc[1]] = (logit + up_lr_logit[:,:,slc[0],slc[1]])/2
++                fuse_logit[:,:,slc[0],slc[1]] = self._fuse_logits(up_lr_logit[:,:,slc[0],slc[1]], logit)
++        
++        if self.detail_branch is not None:
++            fuse_logit = fuse_logit + self.detail_scale * self._detail_logits(img, img_size)
+         
+         fuse_logit = resize(fuse_logit, img_size, mode='bilinear')
+         return fuse_logit
+@@ -149,7 +193,10 @@ class HRDecoder(LesionEncoderDecoder):
+         fuse_logit = up_lr_logit.clone()
+         for logit,_,bbox in zip(*self.hr_slide_inference(img_size, lr_feat, img_metas).values()):
+             slc = slice(bbox[0],bbox[1]),slice(bbox[2],bbox[3])
+-            fuse_logit[:,:,slc[0],slc[1]] = (logit + up_lr_logit[:,:,slc[0],slc[1]])/2
++            fuse_logit[:,:,slc[0],slc[1]] = self._fuse_logits(up_lr_logit[:,:,slc[0],slc[1]], logit)
++        
++        if self.detail_branch is not None:
++            fuse_logit = fuse_logit + self.detail_scale * self._detail_logits(img, img_size)
+         
+         fuse_loss = self.decode_head.losses(fuse_logit,gt_semantic_seg)
+         losses.update(add_prefix(fuse_loss,'fuse'))
+-- 
+2.54.0.windows.1
+
+
+From 5b5675ad0418759156634439f7caef402c50bb1e Mon Sep 17 00:00:00 2001
+From: a1553846342-dotcom <a1553846342@gmail.com>
+Date: Mon, 17 Aug 2026 00:52:44 +0800
+Subject: [PATCH 2/5] fix: no BN on ASPPContext pooling branch (batch-size
+ sensitive)
+
+---
+ mmseg/models/necks/aspp_context.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/mmseg/models/necks/aspp_context.py b/mmseg/models/necks/aspp_context.py
+index ccdc659..57c96e7 100644
+--- a/mmseg/models/necks/aspp_context.py
++++ b/mmseg/models/necks/aspp_context.py
+@@ -42,10 +42,10 @@ class ASPPContext(nn.Module):
+                 ConvModule(in_channels, branch_ch, 3, padding=d, dilation=d,
+                            conv_cfg=conv_cfg, norm_cfg=norm_cfg,
+                            act_cfg=act_cfg))
+-        # image pooling branch
++        # image pooling branch (no BN: 1x1 spatial map is batch-size sensitive)
+         self.branches.append(
+             ConvModule(in_channels, branch_ch, 1, conv_cfg=conv_cfg,
+-                       norm_cfg=norm_cfg, act_cfg=act_cfg))
++                       norm_cfg=None, act_cfg=act_cfg))
+         self.pool = nn.AdaptiveAvgPool2d(1)
+         # fuse branches
+         self.fuse = ConvModule(branch_ch * n_branches, out_channels, 1,
+-- 
+2.54.0.windows.1
+
+
+From abd8a28203b1e3b2877482f4936256c3e0b0c005 Mon Sep 17 00:00:00 2001
+From: a1553846342-dotcom <a1553846342@gmail.com>
+Date: Mon, 17 Aug 2026 03:03:25 +0800
+Subject: [PATCH 3/5] E1: alpha 0.3->0.7 (FN-penalizing); add E4 bs1 fallback
+ config
+
+---
+ configs/lesion/exp/e1_tversky_split613.py    | 14 +++++++++-----
+ configs/lesion/exp/e4_detail_split613_bs1.py |  9 +++++++++
+ 2 files changed, 18 insertions(+), 5 deletions(-)
+ create mode 100644 configs/lesion/exp/e4_detail_split613_bs1.py
+
+diff --git a/configs/lesion/exp/e1_tversky_split613.py b/configs/lesion/exp/e1_tversky_split613.py
+index 3cd7050..8e24194 100644
+--- a/configs/lesion/exp/e1_tversky_split613.py
++++ b/configs/lesion/exp/e1_tversky_split613.py
+@@ -2,11 +2,15 @@ _base_ = './baseline_split613.py'
+ 
+ # ============================================================
+ # exp/e1_tversky_split613.py — E1: replace per-class Dice with
+-# Tversky loss (alpha=0.3 -> beta=0.7, FN-penalizing).
++# Tversky loss. alpha weights FN (den = TP + alpha*FN + beta*FP,
++# beta = 1-alpha). alpha=0.7 -> FN penalized more -> recall push.
++# (First attempt used alpha=0.3 = FP-penalizing; that run
++# collapsed to all-positive predictions at iter 4000 — recorded
++# in EXPERIMENT_LOG. This alpha=0.7 variant is the recall-targeted
++# setting; iter-4000 val is checked for the same collapse.)
+ # Hypothesis: MA/HE recall is limited by the balanced Dice
+-# surface; Tversky with beta>alpha pushes the model to reduce
+-# false negatives without the class-weight coupling problem
+-# that made 板块三 weighting fail.
++# surface; Tversky with alpha>beta reduces false negatives without
++# the class-weight coupling problem that made 板块三 weighting fail.
+ # ============================================================
+ 
+ model = dict(
+@@ -16,7 +20,7 @@ model = dict(
+             loss_type='tversky',
+             loss_weight=1.0,
+             smooth=1e-5,
+-            loss_hyper=dict(alpha=0.3),
++            loss_hyper=dict(alpha=0.7),
+         )
+     )
+ )
+diff --git a/configs/lesion/exp/e4_detail_split613_bs1.py b/configs/lesion/exp/e4_detail_split613_bs1.py
+new file mode 100644
+index 0000000..9bdf3e9
+--- /dev/null
++++ b/configs/lesion/exp/e4_detail_split613_bs1.py
+@@ -0,0 +1,9 @@
++_base_ = './e4_detail_split613.py'
++
++# Fallback if E4 OOMs at bs=2: single sample per GPU with halved lr
++# (same compromise documented in the repo's 方案 B comment).
++data = dict(
++    samples_per_gpu=1,
++    workers_per_gpu=2,
++)
++optimizer = dict(type='SGD', lr=0.0025, momentum=0.9, weight_decay=0.0005)
+-- 
+2.54.0.windows.1
+
+
+From bb303a79af92cbe2e75916f3b37b6c157771aaa8 Mon Sep 17 00:00:00 2001
+From: a1553846342-dotcom <a1553846342@gmail.com>
+Date: Mon, 17 Aug 2026 03:48:46 +0800
+Subject: [PATCH 4/5] E1-v2 ce_dice config; e2e3 combo config; e1e4 combo
+ config
+
+---
+ configs/lesion/exp/e1_cedice_split613.py | 27 ++++++++++++++++++
+ configs/lesion/exp/e1e4_split613.py      | 35 ++++++++++++++++++++++++
+ configs/lesion/exp/e2e3_split613.py      | 20 ++++++++++++++
+ 3 files changed, 82 insertions(+)
+ create mode 100644 configs/lesion/exp/e1_cedice_split613.py
+ create mode 100644 configs/lesion/exp/e1e4_split613.py
+ create mode 100644 configs/lesion/exp/e2e3_split613.py
+
+diff --git a/configs/lesion/exp/e1_cedice_split613.py b/configs/lesion/exp/e1_cedice_split613.py
+new file mode 100644
+index 0000000..c2da4b6
+--- /dev/null
++++ b/configs/lesion/exp/e1_cedice_split613.py
+@@ -0,0 +1,27 @@
++_base_ = './baseline_split613.py'
++
++# ============================================================
++# exp/e1_cedice_split613.py — E1-v2: CE + Dice combined loss.
++# (Tversky alpha=0.3 and 0.7 both collapsed to all-positive at
++# iter 4000 — recorded in EXPERIMENT_LOG; mechanism: Tversky's
++# numerator TP (vs Dice's 2TP) halves/weakens the background
++# suppression gradient, so the model cannot escape the
++# all-positive attractor.)
++# CE+Dice is the codebase-native combination
++# (binary_ce_dice_loss): CE gives strong per-pixel gradients
++# (background suppression + score calibration -> helps AUPR),
++# Dice keeps the class-sum structure of the original loss.
++# Hypothesis: stronger background suppression improves MA/HE
++# precision-recall balance without the Tversky collapse.
++# ============================================================
++
++model = dict(
++    decode_head=dict(
++        loss_decode=dict(
++            type='BinaryLoss',
++            loss_type='ce_dice',
++            loss_weight=1.0,
++            smooth=1e-5,
++        )
++    )
++)
+diff --git a/configs/lesion/exp/e1e4_split613.py b/configs/lesion/exp/e1e4_split613.py
+new file mode 100644
+index 0000000..99f68f2
+--- /dev/null
++++ b/configs/lesion/exp/e1e4_split613.py
+@@ -0,0 +1,35 @@
++_base_ = './baseline_split613.py'
++
++# ============================================================
++# exp/e1e4_split613.py — E1 (Tversky alpha=0.7, FN-penalizing)
++# + E4 (full-res detail branch). Both target the MA bottleneck
++# (recall via loss surface, resolution via detail features).
++# Used for the stacked ablation row (E1+E4).
++# ============================================================
++
++model = dict(
++    decode_head=dict(
++        loss_decode=dict(
++            type='BinaryLoss',
++            loss_type='tversky',
++            loss_weight=1.0,
++            smooth=1e-5,
++            loss_hyper=dict(alpha=0.7),
++        )
++    ),
++    detail_branch=dict(
++        type='DetailBranch',
++        mid_channels=32,
++        out_channels=32,
++        norm_cfg=dict(type='BN', requires_grad=True),
++        act_cfg=dict(type='ReLU'),
++    ),
++    detail_head=dict(
++        type='DetailHead',
++        in_channels=32,
++        mid_channels=32,
++        num_classes=4,
++        norm_cfg=dict(type='BN', requires_grad=True),
++        act_cfg=dict(type='ReLU'),
++    ),
++)
+diff --git a/configs/lesion/exp/e2e3_split613.py b/configs/lesion/exp/e2e3_split613.py
+new file mode 100644
+index 0000000..56c508f
+--- /dev/null
++++ b/configs/lesion/exp/e2e3_split613.py
+@@ -0,0 +1,20 @@
++_base_ = './baseline_split613.py'
++
++# ============================================================
++# exp/e2e3_split613.py — E2 (learnable LR/HR logit fusion) +
++# E3 (ASPP-lite context in decoder). Orthogonal changes; used
++# for the stacked ablation row (E2+E3) and as a building block
++# for the final combination.
++# ============================================================
++
++model = dict(
++    hr_settings=dict(
++        fuse_mode='learnable',
++    ),
++    decode_head=dict(
++        context_cfg=dict(
++            type='ASPPContext',
++            dilations=(6, 12, 18),
++        )
++    )
++)
+-- 
+2.54.0.windows.1
+
+
+From 58eca134a1be6b2a13302490b9056c760ca67a26 Mon Sep 17 00:00:00 2001
+From: a1553846342-dotcom <a1553846342@gmail.com>
+Date: Mon, 17 Aug 2026 22:14:06 +0800
+Subject: [PATCH 5/5] E4v2: direct auxiliary dice loss on detail head;
+ e4v2/combo_v2 configs; drop seed configs from chain
+
+---
+ configs/lesion/exp/combo_v2_split613.py       | 14 ++++
+ configs/lesion/exp/e4v2_detail_split613.py    | 34 ++++++++++
+ configs/lesion/exp/final_combo_split613.py    | 34 ++++++++++
+ .../exp/final_combo_split613_seed123.py       |  4 ++
+ .../exp/final_combo_split613_seed2024.py      |  4 ++
+ mmseg/models/segmentors/HRDecoder.py          | 67 ++++++++++++++++++-
+ 6 files changed, 155 insertions(+), 2 deletions(-)
+ create mode 100644 configs/lesion/exp/combo_v2_split613.py
+ create mode 100644 configs/lesion/exp/e4v2_detail_split613.py
+ create mode 100644 configs/lesion/exp/final_combo_split613.py
+ create mode 100644 configs/lesion/exp/final_combo_split613_seed123.py
+ create mode 100644 configs/lesion/exp/final_combo_split613_seed2024.py
+
+diff --git a/configs/lesion/exp/combo_v2_split613.py b/configs/lesion/exp/combo_v2_split613.py
+new file mode 100644
+index 0000000..cce63a6
+--- /dev/null
++++ b/configs/lesion/exp/combo_v2_split613.py
+@@ -0,0 +1,14 @@
++_base_ = './final_combo_split613.py'
++
++# ============================================================
++# exp/combo_v2_split613.py — COMBO-v2: E4 detail branch +
++# CE+Dice + direct auxiliary loss on the detail head.
++# Extends the current best candidate (E4+CE+Dice) with the
++# E4v2 fix for the detail path's precision problem.
++# ============================================================
++
++model = dict(
++    hr_settings=dict(
++        detail_loss_weight=0.3,
++    ),
++)
+diff --git a/configs/lesion/exp/e4v2_detail_split613.py b/configs/lesion/exp/e4v2_detail_split613.py
+new file mode 100644
+index 0000000..e3330d0
+--- /dev/null
++++ b/configs/lesion/exp/e4v2_detail_split613.py
+@@ -0,0 +1,34 @@
++_base_ = './baseline_split613.py'
++
++# ============================================================
++# exp/e4v2_detail_split613.py — E4-v2: detail branch WITH direct
++# auxiliary loss on the detail head.
++# E4 (detail branch only) raised MA recall (+5.8pp) but hurt
++# precision (-7.7pp): the detail head is only trained indirectly
++# through the fused loss, so its logits are noisy. E4-v2 adds a
++# direct dice loss (weight 0.3) on the upsampled detail logits,
++# training the detail head to be precise on its own.
++# Hypothesis: direct supervision fixes the FP problem -> MA
++# precision/IoU/AUPR improve without losing the recall gain.
++# ============================================================
++
++model = dict(
++    hr_settings=dict(
++        detail_loss_weight=0.3,
++    ),
++    detail_branch=dict(
++        type='DetailBranch',
++        mid_channels=32,
++        out_channels=32,
++        norm_cfg=dict(type='BN', requires_grad=True),
++        act_cfg=dict(type='ReLU'),
++    ),
++    detail_head=dict(
++        type='DetailHead',
++        in_channels=32,
++        mid_channels=32,
++        num_classes=4,
++        norm_cfg=dict(type='BN', requires_grad=True),
++        act_cfg=dict(type='ReLU'),
++    ),
++)
+diff --git a/configs/lesion/exp/final_combo_split613.py b/configs/lesion/exp/final_combo_split613.py
+new file mode 100644
+index 0000000..54263d8
+--- /dev/null
++++ b/configs/lesion/exp/final_combo_split613.py
+@@ -0,0 +1,34 @@
++_base_ = './baseline_split613.py'
++
++# ============================================================
++# exp/final_combo_split613.py — FINAL combination (filled in after
++# individual results): E4 detail branch + E1v2 CE+Dice
++# (+ E2E3 if it wins standalone). Kept as a template that the
++# researcher edits based on the ablation results.
++# ============================================================
++
++model = dict(
++    decode_head=dict(
++        loss_decode=dict(
++            type='BinaryLoss',
++            loss_type='ce_dice',
++            loss_weight=1.0,
++            smooth=1e-5,
++        )
++    ),
++    detail_branch=dict(
++        type='DetailBranch',
++        mid_channels=32,
++        out_channels=32,
++        norm_cfg=dict(type='BN', requires_grad=True),
++        act_cfg=dict(type='ReLU'),
++    ),
++    detail_head=dict(
++        type='DetailHead',
++        in_channels=32,
++        mid_channels=32,
++        num_classes=4,
++        norm_cfg=dict(type='BN', requires_grad=True),
++        act_cfg=dict(type='ReLU'),
++    ),
++)
+diff --git a/configs/lesion/exp/final_combo_split613_seed123.py b/configs/lesion/exp/final_combo_split613_seed123.py
+new file mode 100644
+index 0000000..436d609
+--- /dev/null
++++ b/configs/lesion/exp/final_combo_split613_seed123.py
+@@ -0,0 +1,4 @@
++_base_ = './final_combo_split613.py'
++
++# seed 123 variant (variance estimation)
++seed = 123
+diff --git a/configs/lesion/exp/final_combo_split613_seed2024.py b/configs/lesion/exp/final_combo_split613_seed2024.py
+new file mode 100644
+index 0000000..413e47c
+--- /dev/null
++++ b/configs/lesion/exp/final_combo_split613_seed2024.py
+@@ -0,0 +1,4 @@
++_base_ = './final_combo_split613.py'
++
++# seed 2024 variant (variance estimation, runs on S1 after E2E3)
++seed = 2024
+diff --git a/mmseg/models/segmentors/HRDecoder.py b/mmseg/models/segmentors/HRDecoder.py
+index 93cf216..aebadcf 100644
+--- a/mmseg/models/segmentors/HRDecoder.py
++++ b/mmseg/models/segmentors/HRDecoder.py
+@@ -67,6 +67,13 @@ class HRDecoder(LesionEncoderDecoder):
+         self.lr_loss_weight=hr_settings.get('lr_loss_weight',0)
+         self.crop_num = hr_settings.pop('crop_num', 4)
+         self.scale_ratio = hr_settings.pop('scale_ratio', 1)
++        # 板块二 extension (custom, not part of the original paper method):
++        # SE-weighted sliding-window crop for the HR branch (config-gated,
++        # disabled unless crop_mode='se_slide').
++        self.crop_mode = hr_settings.get('crop_mode', 'random')
++        self.slide_stride = hr_settings.get('slide_stride', 512)
++        self.se_weight_beta = hr_settings.get('se_weight_beta', 20.0)
++        self.se_weight_min = hr_settings.get('se_weight_min', 1.0)
+         # ---- E2: learnable LR/HR logit fusion ----
+         self.fuse_mode = hr_settings.pop('fuse_mode', 'simple')
+         if self.fuse_mode == 'learnable':
+@@ -75,6 +82,50 @@ class HRDecoder(LesionEncoderDecoder):
+             self.fuse_lr_w = nn.Parameter(torch.zeros(self.num_classes))
+         else:
+             self.fuse_mode = 'simple'
++        # ---- E4v2: direct auxiliary loss on the detail head ----
++        self.detail_loss_weight = hr_settings.get('detail_loss_weight', 0)
++
++    def get_se_weighted_crop_bboxes(self, img_size, hr_scale,
++                                    gt_semantic_seg):
++        """Sliding-window boxes over the image, sampled with probability
++        proportional to the SE pixel ratio inside each window."""
++        h_img, w_img = img_size
++        h_crop, w_crop = hr_scale
++        h_stride, w_stride = self.slide_stride, self.slide_stride
++        h_grids = max(h_img - h_crop + h_stride - 1, 0) // h_stride + 1
++        w_grids = max(w_img - w_crop + w_stride - 1, 0) // w_stride + 1
++
++        boxes = []
++        for h_idx in range(h_grids):
++            for w_idx in range(w_grids):
++                y1, x1 = h_idx * h_stride, w_idx * w_stride
++                y2, x2 = min(y1 + h_crop, h_img), min(x1 + w_crop, w_img)
++                y1, x1 = max(y2 - h_crop, 0), max(x2 - w_crop, 0)
++                boxes.append([y1, y2, x1, x2])
++
++        ratios = []
++        for box in boxes:
++            y1, y2, x1, x2 = box
++            g = gt_semantic_seg[:, :, y1:y2, x1:x2]
++            se_px = (g == 3).sum().float()
++            ratios.append(float((se_px / max(g.numel(), 1)).item()))
++        ratios = np.array(ratios, dtype=np.float64)
++
++        max_r = ratios.max() if ratios.size else 0.0
++        if max_r > 0:
++            weights = self.se_weight_min + self.se_weight_beta * (
++                ratios / max_r)
++        else:
++            weights = np.ones_like(ratios)
++
++        n_boxes = len(boxes)
++        if n_boxes == 0:
++            return [get_crop_bbox(img_size, hr_scale, self.divisible)
++                    for _ in range(self.crop_num)]
++        replace = n_boxes < self.crop_num
++        idx = np.random.choice(n_boxes, size=self.crop_num, replace=replace,
++                               p=weights / weights.sum())
++        return [boxes[i] for i in idx]
+ 
+     def _fuse_logits(self, lr_logit, hr_logit):
+         """Fuse LR (full-size) and HR (crop-size) logits.
+@@ -120,7 +171,12 @@ class HRDecoder(LesionEncoderDecoder):
+     def hr_forward_train(self, lr_feat, gt_semantic_seg):
+         img_size = gt_semantic_seg.shape[2:]
+         hr_scale = self.get_random_hr_scale()
+-        hr_bboxes = [get_crop_bbox(img_size,hr_scale,self.divisible) for i in range(self.crop_num)]
++        if self.crop_mode == 'se_slide':
++            hr_bboxes = self.get_se_weighted_crop_bboxes(
++                img_size, hr_scale, gt_semantic_seg)
++        else:
++            hr_bboxes = [get_crop_bbox(img_size,hr_scale,self.divisible)
++                         for i in range(self.crop_num)]
+         hr_labels = torch.cat([crop(gt_semantic_seg, hr_bbox) for hr_bbox in hr_bboxes])
+         hr_feats = torch.cat([self._resizecrop_feats(img_size, lr_feat, hr_bbox) for hr_bbox in hr_bboxes])
+         
+@@ -196,7 +252,14 @@ class HRDecoder(LesionEncoderDecoder):
+             fuse_logit[:,:,slc[0],slc[1]] = self._fuse_logits(up_lr_logit[:,:,slc[0],slc[1]], logit)
+         
+         if self.detail_branch is not None:
+-            fuse_logit = fuse_logit + self.detail_scale * self._detail_logits(img, img_size)
++            detail_logit = self._detail_logits(img, img_size)
++            fuse_logit = fuse_logit + self.detail_scale * detail_logit
++            # E4v2: direct supervision on the detail path (fixes its
++            # precision by training the detail head on the GT directly)
++            if self.detail_loss_weight > 0:
++                detail_losses = self.decode_head.losses(detail_logit, gt_semantic_seg)
++                detail_losses['loss_seg'] = detail_losses['loss_seg'] * self.detail_loss_weight
++                losses.update(add_prefix(detail_losses, 'detail'))
+         
+         fuse_loss = self.decode_head.losses(fuse_logit,gt_semantic_seg)
+         losses.update(add_prefix(fuse_loss,'fuse'))
+-- 
+2.54.0.windows.1
+
