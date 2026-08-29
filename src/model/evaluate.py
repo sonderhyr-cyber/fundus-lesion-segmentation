@@ -108,16 +108,22 @@ class PRHistogram:
         to low. This is the same step-wise definition sklearn's
         average_precision_score uses (no trapezoidal interpolation).
         """
-        pos = self.pos.flip(0).cumsum(0).double()   # TP at each threshold
-        neg = self.neg.flip(0).cumsum(0).double()   # FP at each threshold
-        total_pos = float(self.pos.sum().item())
+        # Move to CPU before the float64 reduction: Apple MPS has no float64
+        # support, and float32 is not enough precision for a cumulative sum over
+        # ~1e9 pixels (it starts losing counts around 1.7e7).
+        pos_hist = self.pos.cpu()
+        neg_hist = self.neg.cpu()
+
+        pos = pos_hist.flip(0).cumsum(0).double()   # TP at each threshold
+        neg = neg_hist.flip(0).cumsum(0).double()   # FP at each threshold
+        total_pos = float(pos_hist.sum().item())
         if total_pos == 0:
             return float("nan")  # class absent from this split — undefined, not 0
 
         # Guard against the floor-saturation failure mode described above: if
         # most positives landed in the bottom bin, scores are being quantised
         # into a tie and the AP is no longer trustworthy.
-        saturated = float(self.pos[0].item()) / total_pos
+        saturated = float(pos_hist[0].item()) / total_pos
         if saturated > 0.01:
             print(
                 f"  [WARN] {saturated:.1%} of positive pixels have probability "
@@ -147,7 +153,12 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-def load_model(model_name: str, checkpoint_path: Path, device: torch.device) -> nn.Module:
+def load_model(
+    model_name: str,
+    checkpoint_path: Path | None,
+    device: torch.device,
+    cfg: dict | None = None,
+) -> nn.Module:
     """
     Build any supported architecture and load weights into it.
 
@@ -155,12 +166,12 @@ def load_model(model_name: str, checkpoint_path: Path, device: torch.device) -> 
     the architecture that was actually trained.
     """
     from model.train import build_model
-    from model.loss import FocalTverskyLoss
+    from model.loss import build_loss
 
     # HRDecoder's constructor needs a criterion for its auxiliary HR loss; it is
     # unused at inference time but must be supplied to build the module.
-    criterion = FocalTverskyLoss(num_classes=NUM_CLASSES)
-    model, default_ckpt = build_model(model_name, criterion, device)
+    criterion = build_loss((cfg or {}).get("loss"), num_classes=NUM_CLASSES).to(device)
+    model, default_ckpt = build_model(model_name, criterion, device, cfg=cfg)
 
     path = Path(checkpoint_path) if checkpoint_path is not None else default_ckpt
     if not path.is_absolute():
@@ -261,13 +272,20 @@ def _summarise(histograms: dict[int, PRHistogram], confusion: np.ndarray) -> dic
 # Reporting
 # ---------------------------------------------------------------------------
 
-def format_report(model_name: str, checkpoint: Path, split: str, m: dict) -> str:
+def format_report(
+    model_name: str,
+    checkpoint: Path | str,
+    split: str,
+    m: dict,
+    remove_black_border: bool = False,
+) -> str:
     lines = [
         "=" * 62,
         f"Model      : {model_name}",
         f"Checkpoint : {checkpoint}",
         f"Split      : {split}",
         "Protocol   : native-resolution, softmax probabilities, global PR curve",
+        f"Black crop : {remove_black_border}",
         "=" * 62,
         f"{'class':<12}{'AUPR':>12}{'Dice':>12}{'IoU':>12}",
         "-" * 62,
@@ -296,13 +314,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Unified mAUPR/mDice/mIoU evaluation at native resolution"
     )
-    parser.add_argument("--model", default="unet", choices=["unet", "hrdecoder", "m2mrf"])
+    parser.add_argument("--model", default=None, choices=["unet", "hrdecoder", "m2mrf"])
+    parser.add_argument(
+        "--config", default=None,
+        help="Training experiment YAML; required for non-default architecture/preprocessing",
+    )
     parser.add_argument(
         "--checkpoint", default=None,
         help="Path to checkpoint (default: the model's configured checkpoint)",
     )
     parser.add_argument(
-        "--split", default="test", choices=["train", "valid", "test"],
+        "--split", default="test", choices=["train", "valid", "val", "test"],
         help="Split to evaluate (default: test)",
     )
     parser.add_argument(
@@ -311,26 +333,66 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    from model.train import PROJECT_ROOT as TRAIN_PROJECT_ROOT, _load_cfg
+
+    preliminary_model = args.model or "unet"
+    cfg = _load_cfg(preliminary_model, args.config)
+    model_name = args.model or cfg.get("model", {}).get("name", "unet")
+    if args.model is not None and cfg.get("model", {}).get("name", args.model) != args.model:
+        raise ValueError(
+            f"--model {args.model} conflicts with model.name={cfg['model']['name']}"
+        )
+    data_cfg = cfg.get("data", {})
+    data_root = Path(data_cfg.get("root", "dataset/Segmentation"))
+    if not data_root.is_absolute():
+        data_root = TRAIN_PROJECT_ROOT / data_root
+    preprocess_kwargs = {
+        "remove_black_border": bool(data_cfg.get("remove_black_border", False)),
+        "black_border_threshold": int(data_cfg.get("black_border_threshold", 10)),
+        "black_border_padding_ratio": float(data_cfg.get("black_border_padding_ratio", 0.02)),
+    }
+
     device = get_device()
     print(f"Device: {device}")
 
-    model = load_model(args.model, args.checkpoint, device)
+    model = load_model(model_name, args.checkpoint, device, cfg=cfg)
 
-    dataset = FundusSegmentationDataset(split=args.split, native_mask=True)
+    dataset = FundusSegmentationDataset(
+        root=data_root,
+        split="valid" if args.split == "val" else args.split,
+        native_mask=True,
+        **preprocess_kwargs,
+    )
     if args.limit is not None:
         dataset.samples = dataset.samples[: args.limit]
         print(f"  [smoke test] limited to {len(dataset.samples)} images")
-    print(f"  {args.split}: {len(dataset)} images")
+    expected_counts = data_cfg.get("expected_counts", {})
+    expected = expected_counts.get(args.split)
+    if expected is None and args.split in {"valid", "val"}:
+        expected = expected_counts.get("valid", expected_counts.get("val"))
+    if expected is not None and args.limit is None and len(dataset) != int(expected):
+        raise RuntimeError(
+            f"{args.split} split has {len(dataset)} images, expected {expected}. "
+            f"Refusing to evaluate a mismatched dataset protocol."
+        )
+    print(f"  {args.split}: {len(dataset)} images from {data_root}")
 
     # batch_size MUST be 1: native-resolution masks have differing shapes.
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=2)
 
     metrics = evaluate(model, loader, device)
 
-    report = format_report(args.model, args.checkpoint or "(config default)", args.split, metrics)
+    report = format_report(
+        model_name,
+        args.checkpoint or "(config default)",
+        args.split,
+        metrics,
+        remove_black_border=preprocess_kwargs["remove_black_border"],
+    )
     print(report)
 
-    out_path = OUTPUT_DIR / args.model / "eval.txt"
+    experiment_name = Path(args.config).stem if args.config else model_name
+    out_path = OUTPUT_DIR / experiment_name / "eval.txt"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "a", encoding="utf-8") as f:
         f.write(report)
