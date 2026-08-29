@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import random
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import yaml
@@ -14,10 +16,10 @@ PROJECT_ROOT = SRC_DIR.parent
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from paths import CHECKPOINT_PATH, OUTPUT_DIR
+from paths import CHECKPOINT_PATH
 from dataset import NUM_CLASSES, ForegroundPatchDataset, FundusSegmentationDataset
 from model.unet import UNet
-from model.loss import FocalTverskyLoss
+from model.loss import build_loss
 
 BATCH_SIZE    = 4
 EPOCHS        = 100
@@ -40,19 +42,29 @@ RESET_TRAINING = True
 # Model factory
 # ---------------------------------------------------------------------------
 
-def _load_cfg(model_name: str) -> dict:
-    """Load configs/{model_name}.yaml if it exists; return empty dict otherwise."""
-    cfg_path = PROJECT_ROOT / "configs" / f"{model_name}.yaml"
+def _load_cfg(model_name: str, config_path: str | Path | None = None) -> dict:
+    """Load an explicit experiment config or the model's default YAML."""
+    cfg_path = Path(config_path) if config_path is not None else Path("configs") / f"{model_name}.yaml"
+    if not cfg_path.is_absolute():
+        cfg_path = PROJECT_ROOT / cfg_path
     if cfg_path.exists():
         with open(cfg_path, encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
+    if config_path is not None:
+        raise FileNotFoundError(f"Config not found: {cfg_path}")
     return {}
+
+
+def _resolve_project_path(path: str | Path) -> Path:
+    resolved = Path(path)
+    return resolved if resolved.is_absolute() else PROJECT_ROOT / resolved
 
 
 def build_model(
     model_name: str,
     criterion: nn.Module,
     device: torch.device,
+    cfg: dict | None = None,
 ) -> tuple[nn.Module, Path]:
     """
     Instantiate a model by name.
@@ -60,7 +72,7 @@ def build_model(
     Returns (model, checkpoint_path).
     Supported names: 'unet', 'hrdecoder'.
     """
-    cfg = _load_cfg(model_name)
+    cfg = cfg if cfg is not None else _load_cfg(model_name)
     model_cfg = cfg.get("model", {})
     ckpt_cfg  = cfg.get("checkpoint", {})
 
@@ -79,6 +91,10 @@ def build_model(
             crop_num=model_cfg.get("crop_num", 2),
             divisible=model_cfg.get("divisible", 8),
             criterion=criterion,        # needed for HR auxiliary loss
+            reassembly=model_cfg.get("reassembly", "bilinear"),
+            m2mrf_patch_size=model_cfg.get("m2mrf_patch_size", 8),
+            m2mrf_encode_channels_rate=model_cfg.get("m2mrf_encode_channels_rate", 4),
+            m2mrf_fc_channels_rate=model_cfg.get("m2mrf_fc_channels_rate", 64),
         )
         ckpt_dir = PROJECT_ROOT / ckpt_cfg.get("dir", "outputs/checkpoints")
         ckpt_file = ckpt_cfg.get("filename", "hrdecoder_best.pth")
@@ -218,16 +234,31 @@ def main() -> None:
     parser.add_argument(
         "--model",
         type=str,
-        default="unet",
+        default=None,
         choices=["unet", "hrdecoder", "m2mrf"],
-        help="Model architecture to train (default: unet)",
+        help="Model architecture (defaults to model.name in --config, then unet)",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Experiment YAML path, relative to project root or absolute",
     )
     args = parser.parse_args()
-    model_name = args.model
 
-    # Load per-model config overrides (if configs/{model}.yaml exists)
-    cfg = _load_cfg(model_name)
+    preliminary_model = args.model or "unet"
+    cfg = _load_cfg(preliminary_model, args.config)
+    model_name = args.model or cfg.get("model", {}).get("name", "unet")
+    if args.model is not None and cfg.get("model", {}).get("name", args.model) != args.model:
+        raise ValueError(
+            f"--model {args.model} conflicts with model.name="
+            f"{cfg['model']['name']} in {args.config}"
+        )
+    if args.config is None and model_name != preliminary_model:
+        cfg = _load_cfg(model_name)
+
     train_cfg = cfg.get("training", {})
+    data_cfg = cfg.get("data", {})
+    seed = int(cfg.get("experiment", {}).get("seed", train_cfg.get("seed", 42)))
 
     batch_size          = train_cfg.get("batch_size", BATCH_SIZE)
     epochs              = train_cfg.get("epochs", EPOCHS)
@@ -236,38 +267,75 @@ def main() -> None:
     fg_ratio            = train_cfg.get("fg_ratio", FG_RATIO)
     early_stop_patience = train_cfg.get("early_stop_patience", EARLY_STOP_PATIENCE)
     reset_training      = train_cfg.get("reset_training", RESET_TRAINING)
+    num_workers         = train_cfg.get("num_workers", 4)
+
+    data_root = _resolve_project_path(data_cfg.get("root", "dataset/Segmentation"))
+    preprocess_kwargs = {
+        "remove_black_border": bool(data_cfg.get("remove_black_border", False)),
+        "black_border_threshold": int(data_cfg.get("black_border_threshold", 10)),
+        "black_border_padding_ratio": float(data_cfg.get("black_border_padding_ratio", 0.02)),
+    }
 
     device = get_device()
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     print(f"Model: {model_name}  |  Device: {device}")
 
     train_dataset = ForegroundPatchDataset(
+        root=data_root,
         split="train",
         epoch_size=epoch_size,
         fg_ratio=fg_ratio,
         transform=None,
+        seed=seed,
+        **preprocess_kwargs,
     )
-    val_dataset = FundusSegmentationDataset(split="valid")
+    val_dataset = FundusSegmentationDataset(
+        root=data_root,
+        split="valid",
+        **preprocess_kwargs,
+    )
+
+    expected_counts = data_cfg.get("expected_counts", {})
+    for split_name, actual in (("train", len(train_dataset._samples)), ("valid", len(val_dataset))):
+        expected = expected_counts.get(split_name, expected_counts.get("val") if split_name == "valid" else None)
+        if expected is not None and actual != int(expected):
+            raise RuntimeError(
+                f"{split_name} split has {actual} images, expected {expected}. "
+                f"Refusing to mix dataset protocols under {data_root}."
+            )
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=num_workers,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=num_workers,
     )
 
-    criterion = FocalTverskyLoss(num_classes=NUM_CLASSES)
-    model, ckpt_path = build_model(model_name, criterion, device)
+    criterion = build_loss(cfg.get("loss"), num_classes=NUM_CLASSES).to(device)
+    model, ckpt_path = build_model(model_name, criterion, device, cfg=cfg)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5
+        optimizer,
+        mode="min",
+        factor=float(train_cfg.get("scheduler_factor", 0.5)),
+        patience=int(train_cfg.get("scheduler_patience", 5)),
     )
 
+    print(f"Config: {args.config or f'configs/{model_name}.yaml'}")
+    print(f"Seed: {seed}")
+    print(f"Data root: {data_root}")
+    print(f"Black-border crop: {preprocess_kwargs['remove_black_border']}")
+    print(f"Loss: {cfg.get('loss', {'name': 'focal_tversky'})}")
     print(f"Checkpoint path: {ckpt_path}")
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 

@@ -5,6 +5,7 @@ Usage:
     python train.py                   # train default model (unet)
     python train.py --model unet
     python train.py --model hrdecoder
+    python train.py --config configs/experiments/hrdecoder_m2mrf_combo_613.yaml
 
 This script only sets up the Python path and delegates to src/model/train.py.
 All training logic lives in src/model/train.py.

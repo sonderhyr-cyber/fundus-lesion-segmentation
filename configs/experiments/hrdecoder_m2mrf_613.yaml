@@ -1,0 +1,47 @@
+experiment:
+  name: hrdecoder_m2mrf_613
+  split: 454/76/227
+  seed: 42
+
+model:
+  name: hrdecoder
+  num_classes: 5
+  pretrained: true
+  hr_scale: [512, 512]
+  scale_ratio: [0.75, 1.25]
+  hr_loss_weight: 0.1
+  crop_num: 2
+  divisible: 8
+  reassembly: m2mrf
+  m2mrf_patch_size: 8
+  m2mrf_encode_channels_rate: 4
+  m2mrf_fc_channels_rate: 64
+
+data:
+  root: dataset/DDR_split_613
+  expected_counts: {train: 454, valid: 76, test: 227}
+  remove_black_border: true
+  black_border_threshold: 10
+  black_border_padding_ratio: 0.02
+
+training:
+  batch_size: 4
+  epochs: 100
+  learning_rate: 3.0e-4
+  epoch_size: 1500
+  fg_ratio: 0.8
+  num_workers: 4
+  scheduler_factor: 0.5
+  scheduler_patience: 5
+  early_stop_patience: 20
+  reset_training: true
+
+loss:
+  name: focal_tversky
+  alpha: 0.3
+  beta: 0.7
+  gamma: 0.75
+
+checkpoint:
+  dir: outputs/checkpoints
+  filename: hrdecoder_m2mrf_613_best.pth

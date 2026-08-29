@@ -18,6 +18,79 @@ IMAGE_SIZE = (512, 512)
 CLAHE_CLIP_LIMIT = 2.0
 CLAHE_TILE_SIZE = 8
 GAMMA = 0.8  # < 1 brightens dark regions, enhancing low-contrast lesions (MA)
+BLACK_BORDER_THRESHOLD = 10
+BLACK_BORDER_PADDING_RATIO = 0.02
+
+
+def find_fundus_bbox(
+    image_rgb: np.ndarray,
+    threshold: int = BLACK_BORDER_THRESHOLD,
+    padding_ratio: float = BLACK_BORDER_PADDING_RATIO,
+) -> tuple[int, int, int, int]:
+    """Return the padded bounding box of the largest non-black image region.
+
+    The maximum RGB channel is thresholded so dim red retinal pixels are kept.
+    Selecting the largest connected component rejects isolated text/camera
+    artefacts outside the circular field of view.  Coordinates are returned as
+    ``(x1, y1, x2, y2)`` with exclusive ``x2/y2`` bounds.
+    """
+    if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
+        raise ValueError(f"Expected RGB image [H,W,3], got {image_rgb.shape}")
+
+    height, width = image_rgb.shape[:2]
+    non_black = (image_rgb.max(axis=2) > threshold).astype(np.uint8)
+    count, _, stats, _ = cv2.connectedComponentsWithStats(non_black, connectivity=8)
+    if count <= 1:
+        return 0, 0, width, height
+
+    component = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    x = int(stats[component, cv2.CC_STAT_LEFT])
+    y = int(stats[component, cv2.CC_STAT_TOP])
+    box_w = int(stats[component, cv2.CC_STAT_WIDTH])
+    box_h = int(stats[component, cv2.CC_STAT_HEIGHT])
+
+    # Reject implausibly small components instead of producing a destructive crop.
+    if box_w * box_h < 0.1 * width * height:
+        return 0, 0, width, height
+
+    pad = int(round(max(box_w, box_h) * padding_ratio))
+    x1 = max(x - pad, 0)
+    y1 = max(y - pad, 0)
+    x2 = min(x + box_w + pad, width)
+    y2 = min(y + box_h + pad, height)
+    return x1, y1, x2, y2
+
+
+def crop_black_border(
+    image_rgb: np.ndarray,
+    mask: np.ndarray | None = None,
+    threshold: int = BLACK_BORDER_THRESHOLD,
+    padding_ratio: float = BLACK_BORDER_PADDING_RATIO,
+) -> tuple[np.ndarray, np.ndarray | None, tuple[int, int, int, int]]:
+    """Crop image and optional mask to the same automatically detected fundus ROI."""
+    x1, y1, x2, y2 = find_fundus_bbox(image_rgb, threshold, padding_ratio)
+    image_crop = image_rgb[y1:y2, x1:x2]
+    mask_crop = None if mask is None else mask[y1:y2, x1:x2]
+    return image_crop, mask_crop, (x1, y1, x2, y2)
+
+
+def _shift_polygons_to_crop(
+    polygons: list[tuple[int, np.ndarray]],
+    bbox: tuple[int, int, int, int],
+) -> list[tuple[int, np.ndarray]]:
+    """Translate polygon coordinates into a cropped image coordinate system."""
+    x1, y1, x2, y2 = bbox
+    crop_w, crop_h = x2 - x1, y2 - y1
+    shifted: list[tuple[int, np.ndarray]] = []
+    for class_id, points in polygons:
+        new_points = points.copy()
+        new_points[:, 0] -= x1
+        new_points[:, 1] -= y1
+        new_points[:, 0] = np.clip(new_points[:, 0], 0, max(crop_w - 1, 0))
+        new_points[:, 1] = np.clip(new_points[:, 1], 0, max(crop_h - 1, 0))
+        if len(np.unique(new_points, axis=0)) >= 3:
+            shifted.append((class_id, new_points))
+    return shifted
 
 
 def apply_clahe_gamma(image_rgb: np.ndarray) -> np.ndarray:
@@ -114,6 +187,9 @@ class FundusSegmentationDataset(Dataset):
         split: str = "train",
         transform=None,
         native_mask: bool = False,
+        remove_black_border: bool = False,
+        black_border_threshold: int = BLACK_BORDER_THRESHOLD,
+        black_border_padding_ratio: float = BLACK_BORDER_PADDING_RATIO,
     ) -> None:
         """
         Args:
@@ -132,6 +208,9 @@ class FundusSegmentationDataset(Dataset):
         self.split = split
         self.transform = transform
         self.native_mask = native_mask
+        self.remove_black_border = remove_black_border
+        self.black_border_threshold = black_border_threshold
+        self.black_border_padding_ratio = black_border_padding_ratio
 
         if native_mask and transform is not None:
             raise ValueError(
@@ -139,8 +218,9 @@ class FundusSegmentationDataset(Dataset):
                 "with a transform (image and mask no longer share a shape)."
             )
 
-        image_dir = self.root / "images" / split
-        label_dir = self.root / "labels" / split
+        split_dir = "val" if split == "valid" and not (self.root / "images" / split).exists() else split
+        image_dir = self.root / "images" / split_dir
+        label_dir = self.root / "labels" / split_dir
         self.samples = collect_samples(image_dir, label_dir)
 
         if not self.samples:
@@ -161,6 +241,16 @@ class FundusSegmentationDataset(Dataset):
 
         polygons = parse_yolo_segmentation(label_path, img_h, img_w)
         mask = yolo_polygons_to_semantic_mask(polygons, img_h, img_w)
+
+        if self.remove_black_border:
+            image_rgb, cropped_mask, _ = crop_black_border(
+                image_rgb,
+                mask,
+                threshold=self.black_border_threshold,
+                padding_ratio=self.black_border_padding_ratio,
+            )
+            assert cropped_mask is not None
+            mask = cropped_mask
 
         image_rgb = apply_clahe_gamma(image_rgb)
         image_rgb = cv2.resize(image_rgb, IMAGE_SIZE, interpolation=cv2.INTER_LINEAR)
@@ -240,16 +330,25 @@ class ForegroundPatchDataset(Dataset):
         epoch_size: int = 1500,
         fg_ratio: float = 0.8,
         transform=None,
+        remove_black_border: bool = False,
+        black_border_threshold: int = BLACK_BORDER_THRESHOLD,
+        black_border_padding_ratio: float = BLACK_BORDER_PADDING_RATIO,
+        seed: int = 42,
     ) -> None:
         self.root       = Path(root)
         self.split      = split
         self.epoch_size = epoch_size
         self.fg_ratio   = fg_ratio
         self.transform  = transform
+        self.remove_black_border = remove_black_border
+        self.black_border_threshold = black_border_threshold
+        self.black_border_padding_ratio = black_border_padding_ratio
+        self.rng = np.random.default_rng(seed)
         self.half       = self.PATCH_SIZE // 2
 
-        image_dir = self.root / "images" / split
-        label_dir = self.root / "labels" / split
+        split_dir = "val" if split == "valid" and not (self.root / "images" / split).exists() else split
+        image_dir = self.root / "images" / split_dir
+        label_dir = self.root / "labels" / split_dir
         raw_samples = collect_samples(image_dir, label_dir)
         if not raw_samples:
             raise FileNotFoundError(f"No image-label pairs found under {image_dir}")
@@ -275,6 +374,16 @@ class ForegroundPatchDataset(Dataset):
             h, w = img_rgb.shape[:2]
             polygons = parse_yolo_segmentation(lbl_path, h, w)
             mask = yolo_polygons_to_semantic_mask(polygons, h, w)
+            if self.remove_black_border:
+                img_rgb, cropped_mask, bbox = crop_black_border(
+                    img_rgb,
+                    mask,
+                    threshold=self.black_border_threshold,
+                    padding_ratio=self.black_border_padding_ratio,
+                )
+                assert cropped_mask is not None
+                mask = cropped_mask
+                polygons = _shift_polygons_to_crop(polygons, bbox)
             img_rgb = apply_clahe_gamma(img_rgb)
             self._samples.append((img_path, lbl_path))
             self._polygons.append(polygons)
@@ -297,12 +406,10 @@ class ForegroundPatchDataset(Dataset):
         n_fg = int(self.epoch_size * self.fg_ratio)
         n_bg = self.epoch_size - n_fg
 
-        rng = np.random.default_rng()
-
         epoch: list[tuple[int, int | None, int | None]] = []
 
         # foreground entries
-        chosen_fg = rng.choice(len(self._fg_index), size=n_fg, replace=True)
+        chosen_fg = self.rng.choice(len(self._fg_index), size=n_fg, replace=True)
         for ci in chosen_fg:
             s_idx, p_idx = self._fg_index[ci]
             _, pts = self._polygons[s_idx][p_idx]
@@ -311,11 +418,15 @@ class ForegroundPatchDataset(Dataset):
             epoch.append((s_idx, cx, cy))
 
         # background entries (random crop from any image)
-        chosen_bg = rng.integers(0, len(self._samples), size=n_bg)
+        chosen_bg = self.rng.integers(0, len(self._samples), size=n_bg)
         for s_idx in chosen_bg:
-            epoch.append((int(s_idx), None, None))
+            image = self._image_cache[int(s_idx)]
+            img_h, img_w = image.shape[:2]
+            cx = int(self.rng.integers(self.half, max(self.half + 1, img_w - self.half)))
+            cy = int(self.rng.integers(self.half, max(self.half + 1, img_h - self.half)))
+            epoch.append((int(s_idx), cx, cy))
 
-        rng.shuffle(epoch)
+        self.rng.shuffle(epoch)
         self._epoch_index = epoch
 
     # ------------------------------------------------------------------
@@ -363,4 +474,3 @@ if __name__ == "__main__":
     print(f"Image shape: {tuple(image.shape)}, dtype: {image.dtype}")
     print(f"Mask shape: {tuple(mask.shape)}, dtype: {mask.dtype}")
     print(f"Mask unique classes: {sorted(mask.unique().tolist())}")
-

@@ -38,6 +38,7 @@ import torch.nn.functional as F
 
 from .backbone import HRNetW48
 from .decoder import FCNHead
+from models.m2mrf.reassembly import M2MRFCascadeUpsampler
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +143,10 @@ class HRDecoder(nn.Module):
         crop_num: int = 2,
         divisible: int = 8,
         criterion: nn.Module | None = None,
+        reassembly: str = "bilinear",
+        m2mrf_patch_size: int = 8,
+        m2mrf_encode_channels_rate: int = 4,
+        m2mrf_fc_channels_rate: int = 64,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
@@ -151,9 +156,30 @@ class HRDecoder(nn.Module):
         self.crop_num = crop_num
         self.divisible = divisible
         self.criterion = criterion  # used for HR auxiliary loss
+        self.reassembly = reassembly.lower()
+        if self.reassembly not in {"bilinear", "m2mrf"}:
+            raise ValueError("reassembly must be 'bilinear' or 'm2mrf'")
 
         self.backbone = HRNetW48(pretrained=pretrained)
         in_ch = sum(self.backbone.CHANNELS)  # 720
+        if self.reassembly == "m2mrf":
+            # Branch i is 2**i lower-resolution than branch 0.  Cascading 2x
+            # modules avoids the very large projection created by one 8x step.
+            self.reassemblers = nn.ModuleList([
+                nn.Identity(),
+                *[
+                    M2MRFCascadeUpsampler(
+                        channels=channels,
+                        steps=branch_index,
+                        patch_size=m2mrf_patch_size,
+                        encode_channels_rate=m2mrf_encode_channels_rate,
+                        fc_channels_rate=m2mrf_fc_channels_rate,
+                    )
+                    for branch_index, channels in enumerate(self.backbone.CHANNELS[1:], start=1)
+                ],
+            ])
+        else:
+            self.reassemblers = nn.ModuleList([nn.Identity() for _ in self.backbone.CHANNELS])
         self.head = FCNHead(
             in_channels=in_ch,
             channels=64,
@@ -173,10 +199,20 @@ class HRDecoder(nn.Module):
         Output: (B, 720, H/4, W/4)
         """
         target_h, target_w = feats[0].shape[2], feats[0].shape[3]
-        upsampled = [
-            F.interpolate(f, (target_h, target_w), mode="bilinear", align_corners=False)
-            for f in feats
-        ]
+        upsampled = []
+        for index, feature in enumerate(feats):
+            if index > 0 and self.reassembly == "m2mrf":
+                feature = self.reassemblers[index](feature)
+            if feature.shape[2:] != (target_h, target_w):
+                # Exact-size guard for padded/non-divisible inputs.  In M2MRF
+                # mode this is only a shape correction, not the main reassembly.
+                feature = F.interpolate(
+                    feature,
+                    (target_h, target_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            upsampled.append(feature)
         return torch.cat(upsampled, dim=1)
 
     def _get_random_crop_size(self) -> tuple[int, int]:

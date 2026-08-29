@@ -14,6 +14,7 @@ model:
   hr_loss_weight: 0.1        # auxiliary HR loss weight
   crop_num: 2                # number of HR crops per training step
   divisible: 8               # crop dimensions must be divisible by this
+  reassembly: bilinear       # set to m2mrf for learnable cross-scale reassembly
 
 training:
   batch_size: 4

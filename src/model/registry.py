@@ -31,7 +31,7 @@ def _build_unet(num_classes: int) -> nn.Module:
 
 
 def _build_hrdecoder(num_classes: int) -> nn.Module:
-    from models.hrdecoder import HRDecoder
+    from baselines.hrdecoder import HRDecoder
     return HRDecoder(num_classes=num_classes, pretrained=True)
 
 
